@@ -1,0 +1,27 @@
+vmType: vz
+cpus: 4
+memory: 4GiB
+disk: 30GiB
+mounts: []
+containerd:
+  system: false
+  user: false
+images:
+  - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img
+    arch: aarch64
+  - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
+    arch: x86_64
+portForwards:
+  - guestPort: 8798
+    hostPort: 8798
+  - guestPortRange: [1, 65535]
+    proto: any
+    ignore: true
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eu
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io python3 ca-certificates curl
+      systemctl enable --now docker

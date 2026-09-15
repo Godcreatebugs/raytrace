@@ -1,5 +1,5 @@
 {
-  "name": "sites-project",
+  "name": "raytrace",
   "version": "0.1.0",
   "private": true,
   "engines": {
@@ -10,16 +10,26 @@
     "build": "vinext build",
     "start": "wrangler dev --config dist/server/wrangler.json",
     "lint": "oxlint",
-    "proxy": "node proxy/raytace-proxy.mjs",
-    "format": "oxfmt"
+    "proxy": "node --disable-warning=ExperimentalWarning proxy/raytace-proxy.mjs",
+    "codex": "node proxy/codex.mjs",
+    "sandbox:setup": "node proxy/gvisor-local.mjs setup",
+    "sandbox:run": "node proxy/gvisor-local.mjs run",
+    "sandbox:stop": "node proxy/gvisor-local.mjs stop",
+    "sandbox:manager": "python3 worker/gvisor/project_manager.py serve",
+    "sandbox:import": "python3 worker/gvisor/project_manager.py import",
+    "sandbox:open": "python3 worker/gvisor/project_manager.py open",
+    "sandbox:list": "python3 worker/gvisor/project_manager.py list",
+    "test:engine": "node --disable-warning=ExperimentalWarning --test proxy/*.test.mjs",
+    "format": "oxfmt",
+    "backfill": "node --disable-warning=ExperimentalWarning proxy/backfill.mjs",
+    "docker:build:codex": "docker build -t raytace-codex -f docker/codex/Dockerfile .",
+    "docker:build:tracer": "docker build -t raytace-tracer docker/tracer",
+    "docker:build": "npm run docker:build:codex && npm run docker:build:tracer"
   },
   "dependencies": {
-    "react": "19.2.6",
-    "react-dom": "19.2.6",
-    "react-server-dom-webpack": "19.2.6",
-    "vinext": "1.0.0-beta.5",
     "@base-ui/react": "1.7.0",
     "@shadcn/react": "0.3.0",
+    "@xyflow/react": "^12.11.6",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
     "cmdk": "1.1.1",
@@ -27,12 +37,16 @@
     "embla-carousel-react": "8.5.2",
     "input-otp": "1.4.2",
     "lucide-react": "1.31.0",
+    "react": "19.2.6",
     "react-day-picker": "9.8.1",
+    "react-dom": "19.2.6",
     "react-resizable-panels": "4.5.8",
+    "react-server-dom-webpack": "19.2.6",
     "recharts": "3.8.0",
     "shadcn": "4.18.0",
     "tailwind-merge": "3.6.0",
-    "tw-animate-css": "1.4.0"
+    "tw-animate-css": "1.4.0",
+    "vinext": "1.0.0-beta.5"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.37.1",

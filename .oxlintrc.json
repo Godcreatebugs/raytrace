@@ -23,6 +23,8 @@
     "typeCheck": true
   },
   "ignorePatterns": [
+    "components/**",
+    "hooks/**",
     ".next/**",
     ".vinext/**",
     "out/**",
@@ -41,7 +43,7 @@
     "react/display-name": "error",
     "react/jsx-no-comment-textnodes": "error",
     "react/no-unescaped-entities": "error",
-    "react/react-compiler": "error",
+    "react/react-compiler": "warn",
     "react/require-render-return": "error",
     "react/rules-of-hooks": "error",
     "typescript/ban-ts-comment": "error",

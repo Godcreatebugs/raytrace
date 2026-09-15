@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'Raytace — Agent trace forensics',
+  title: 'RayTrace — Agent trace forensics',
   description: 'Evidence-backed traces and live counterfactual forks for coding agents.',
 };
 

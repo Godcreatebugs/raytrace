@@ -1,5 +1,7 @@
 # dependencies
 /node_modules
+__pycache__/
+*.py[cod]
 /.pnp
 .pnp.*
 .yarn/*
@@ -28,11 +30,21 @@ yarn-error.log*
 
 # local environment
 .env*
+!.env.example
 
 # deployment and generated files
 .vercel
+.openai/hosting.json
 next-env.d.ts
 /dist/
 /.wrangler/
 /outputs/
 /work/
+/.raytace/
+*.tsbuildinfo
+
+# local database (generated; rebuild with `npm run backfill`)
+.raytace/raytace.db
+.raytace/raytace.db-wal
+.raytace/raytace.db-shm
+.raytace/raytace.db-journal
