@@ -2,11 +2,19 @@ import { sites } from '@openai/sites-vite-plugin';
 import tailwindcss from '@tailwindcss/postcss';
 import vinext from 'vinext';
 import { defineConfig } from 'vite';
-import hostingConfig from './.openai/hosting.json';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
   '00000000-0000-4000-8000-000000000000';
 
+// Hosting metadata is machine-specific and intentionally ignored by Git. Keep
+// local development and open-source clones working when it is absent.
+const hostingConfigPath = resolve(process.cwd(), '.openai/hosting.json');
+const hasHostingConfig = existsSync(hostingConfigPath);
+const hostingConfig = hasHostingConfig
+  ? JSON.parse(readFileSync(hostingConfigPath, 'utf8')) as { d1?: string; r2?: string }
+  : {};
 const { d1, r2 } = hostingConfig;
 
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
@@ -51,7 +59,7 @@ export default defineConfig(async () => {
       : undefined,
     plugins: [
       vinext(),
-      sites(),
+      ...(hasHostingConfig ? [sites()] : []),
       cloudflare({
         viteEnvironment: { name: 'rsc', childEnvironments: ['ssr'] },
         config: localBindingConfig,
