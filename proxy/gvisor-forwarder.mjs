@@ -63,13 +63,22 @@ export function toExecutionEvent(event) {
   const eventId = Number(event.event_id);
   if (!command || timestamp == null || !Number.isFinite(pid) || !Number.isFinite(eventId)) return null;
   const container = typeof event.container_id === 'string' ? event.container_id.slice(0, 12) : 'unknown';
+  // `markers` is the collector's allowlisted RAYTRACE_* env (see
+  // worker/gvisor/collector.py MARKER_KEYS). When RAYTRACE_CALL_ID is present
+  // it IS the answer -- the call id travelled with the process -- and the
+  // text matcher is skipped entirely. Absent on every event until something
+  // in the spawn path stamps it, which is why the matcher stays the default.
+  const marker = event.markers && typeof event.markers === 'object' ? event.markers.RAYTRACE_CALL_ID : null;
   return {
     id: `gvisor-${container}-${eventId}`,
     pid,
     ppid: Number.isFinite(Number(event.ppid)) ? Number(event.ppid) : null,
     command,
+    argv,
     cwd: typeof event.cwd === 'string' ? event.cwd : null,
     timestamp,
+    start_time_ns: typeof event.process_start_ns === 'string' ? event.process_start_ns : null,
+    call_marker: typeof marker === 'string' && marker ? marker : null,
   };
 }
 
@@ -84,9 +93,12 @@ export function exitOutcome(event) {
 }
 
 /** Per-sandbox tailing state: how far into the collector's event ids we've
- * read, and which pids currently belong to a matched, still-running command
- * (so their children and same-pid re-execs are skipped, and their exit can
- * be routed back to the right row). */
+ * read, and which pids currently belong to a matched, still-running command.
+ * Each entry is `{ execId, callId }` -- `execId` is that pid's OWN row (so
+ * its exit closes the right one) and `callId` is the proposed call the whole
+ * subtree belongs to (so a child inherits attribution without re-matching).
+ * Same-pid re-execs still collapse onto the first entry: bash exec()ing its
+ * last command in place is one process doing one job, not a new one. */
 export class SandboxTracker {
   constructor() { this.cursor = 0; this.live = new Map(); }
 }
@@ -103,10 +115,13 @@ export class SandboxTracker {
  * @param {(events: Array, opts: {sessionId: string}) => Promise<Map<string, object>>|Map<string, object>} deps.ingest
  *   - resolves executions to call_ids and records them; returns exec id -> match for the ones that matched
  * @param {(row: {id: string, ended_at: string|null, status: string, error: string|null}) => Promise<boolean>|boolean} deps.finish
- * @returns {Promise<{forwarded: number, matched: number, finished: number}>}
+ * @param {(row: {exec: object, parent_call_id: string|null, tier: string}) => Promise<void>|void} [deps.descend]
+ *   - records a process that ran underneath a call, or underneath nothing.
+ *     Defaults to a no-op so existing callers keep their behaviour.
+ * @returns {Promise<{forwarded: number, matched: number, finished: number, descendants: number, unattributed: number}>}
  */
-export async function processEvents(events, { sessionId, tracker, ingest, finish }) {
-  const counts = { forwarded: 0, matched: 0, finished: 0 };
+export async function processEvents(events, { sessionId, tracker, ingest, finish, descend = () => {} }) {
+  const counts = { forwarded: 0, matched: 0, finished: 0, descendants: 0, unattributed: 0 };
   const ordered = (Array.isArray(events) ? events : [])
     .filter((event) => Number.isFinite(Number(event?.event_id)) && Number(event.event_id) > tracker.cursor)
     .sort((a, b) => Number(a.event_id) - Number(b.event_id));
@@ -116,24 +131,49 @@ export async function processEvents(events, { sessionId, tracker, ingest, finish
     if (event.kind === 'exec_succeeded') {
       const exec = toExecutionEvent(event);
       if (!exec) continue;
-      // Same pid already carrying a matched command (bash exec()ing its last
-      // command in place) or a child of one: belongs to that command, never
-      // a candidate for a different call.
-      if (tracker.live.has(exec.pid) || (exec.ppid != null && tracker.live.has(exec.ppid))) continue;
+      // Same pid already carrying a matched command: bash exec()ing its last
+      // command in place. Still one process doing one job -- recording it
+      // again would both double-count and re-point that pid's exit at the
+      // wrong row, so it stays collapsed onto the first entry.
+      if (tracker.live.has(exec.pid)) continue;
+
+      // A child of a command we already attributed. Before migration 005 this
+      // was `continue` -- the event was seen, recognised, and dropped, which
+      // is how a file deleted by an npm pretest hook ended up in gVisor's
+      // stream and nowhere in RayTrace. It now gets its own row hanging off
+      // the owning call, and joins `live` so ITS children inherit too (the
+      // deletion is a grandchild; a one-level check never reached it).
+      const owner = exec.ppid != null ? tracker.live.get(exec.ppid) : null;
+      if (owner) {
+        await descend({ exec, parent_call_id: owner.callId, tier: owner.callId ? 'corroborated' : 'unverified' });
+        tracker.live.set(exec.pid, { execId: exec.id, callId: owner.callId });
+        counts.descendants += 1;
+        continue;
+      }
+
       counts.forwarded += 1;
       const matches = await ingest([exec], { sessionId });
-      if (matches && matches.get && matches.get(exec.id)) {
+      const match = matches && matches.get ? matches.get(exec.id) : null;
+      if (match) {
         counts.matched += 1;
-        tracker.live.set(exec.pid, exec.id);
+        tracker.live.set(exec.pid, { execId: exec.id, callId: match.call_id });
+      } else {
+        // Ran inside the agent's own sandbox, matched no proposed call. Either
+        // the correlator failed or nothing proposed it; both are worth seeing
+        // and neither was storable before 005. Deliberately NOT tracked in
+        // `live`: leaving its children to face the matcher keeps every
+        // existing match outcome identical, so this path only adds rows.
+        await descend({ exec, parent_call_id: null, tier: 'unverified' });
+        counts.unattributed += 1;
       }
     } else if (event.kind === 'process_exit') {
       const pid = Number(event.pid);
-      const id = tracker.live.get(pid);
-      if (!id) continue;
+      const entry = tracker.live.get(pid);
+      if (!entry) continue;
       tracker.live.delete(pid);
       const endedMs = msFromNs(event.timestamp_ns);
       const { status, error } = exitOutcome(event);
-      await finish({ id, ended_at: endedMs == null ? null : new Date(endedMs).toISOString(), status, error });
+      await finish({ id: entry.execId, ended_at: endedMs == null ? null : new Date(endedMs).toISOString(), status, error });
       counts.finished += 1;
     }
   }
@@ -153,6 +193,7 @@ export function startGvisorForwarder({
   viewerBase = 'http://127.0.0.1:8798',
   ingest,
   finish,
+  descend,
   log = (message) => console.error(message),
   fetchImpl = globalThis.fetch,
   pollMs = 1500,
@@ -176,6 +217,18 @@ export function startGvisorForwarder({
     return res.json();
   };
 
+  /** Highest event id the collector currently holds for a container, used to
+   * seed a new tracker so tailing begins at "now". Falls back to 0 -- which
+   * replays history -- only if the viewer cannot be reached, since starting
+   * over-inclusive is recoverable and starting blind is not. */
+  const latestEventId = async (containerId) => {
+    try {
+      const page = await getJson(`${viewerBase}/events?container=${containerId}&limit=1&processes=1`);
+      const ids = (page?.events ?? []).map((e) => Number(e?.event_id)).filter(Number.isFinite);
+      return ids.length ? Math.max(...ids) : 0;
+    } catch { return 0; }
+  };
+
   const discover = () => {
     if (stopped) return Promise.resolve();
     if (discovering) return discovering;
@@ -190,8 +243,18 @@ export function startGvisorForwarder({
         const containerId = project?.container_id;
         if (!SANDBOX_ID.test(sessionId || '') || !CONTAINER_ID.test(containerId || '')) continue;
         if (!sandboxes.has(containerId)) {
-          sandboxes.set(containerId, { sessionId, tracker: new SandboxTracker() });
-          log(`[raytace][gvisor] forwarding evidence for sandbox ${sessionId} (container ${containerId.slice(0, 12)})`);
+          const tracker = new SandboxTracker();
+          // Start from the newest event, not from zero. The collector's
+          // evidence store lives in the VM and is append-only, so it outlives
+          // any proxy restart: a tracker that begins at 0 re-reads days of
+          // history on every start. Those old execs can never match anything
+          // -- the proxy was not capturing model traffic then, so no proposed
+          // call exists for them -- and since they now get written as
+          // unattributed rows rather than dropped, the replay floods the
+          // table and pushes the live session behind a backlog.
+          tracker.cursor = await latestEventId(containerId);
+          sandboxes.set(containerId, { sessionId, tracker });
+          log(`[raytace][gvisor] forwarding evidence for sandbox ${sessionId} (container ${containerId.slice(0, 12)}) from event ${tracker.cursor}`);
         }
       }
       if (managerDown) { managerDown = false; log('[raytace][gvisor] sandbox manager reachable again'); }
@@ -221,8 +284,12 @@ export function startGvisorForwarder({
       // An ingest/finish failure (e.g. a DB error) must not stall the loop
       // or leave the cursor wedged; log it and move on to the next poll.
       try {
-        const counts = await processEvents(page?.events, { sessionId, tracker, ingest, finish });
-        if (counts.matched || counts.finished) log(`[raytace][gvisor] ${sessionId.slice(0, 12)}: ${counts.matched} exec(s) matched to proposed calls, ${counts.finished} closed out, ${counts.forwarded} top-level exec(s) considered`);
+        const counts = await processEvents(page?.events, { sessionId, tracker, ingest, finish, descend });
+        if (counts.matched || counts.finished || counts.descendants || counts.unattributed) {
+          log(`[raytace][gvisor] ${sessionId.slice(0, 12)}: ${counts.matched} exec(s) matched to proposed calls, `
+            + `${counts.descendants} descendant(s), ${counts.unattributed} unattributed, `
+            + `${counts.finished} closed out, ${counts.forwarded} top-level exec(s) considered`);
+        }
       } catch (error) {
         log(`[raytace][gvisor] ${sessionId.slice(0, 12)}: failed to record evidence: ${error.message}`);
       }

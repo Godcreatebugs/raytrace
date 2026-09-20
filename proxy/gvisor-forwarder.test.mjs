@@ -21,8 +21,18 @@ test('msFromNs converts the collector\'s ns strings and rejects garbage', () => 
 
 test('toExecutionEvent maps exec_succeeded into the matcher shape with a collision-proof id', () => {
   assert.deepEqual(toExecutionEvent(exec(42, 10, 1, ['/bin/bash', '-lc', 'git status'])), {
-    id: `gvisor-${'c'.repeat(12)}-42`, pid: 10, ppid: 1, command: '/bin/bash -lc git status', cwd: '/workspace', timestamp: 1_700_000_000_042,
+    id: `gvisor-${'c'.repeat(12)}-42`, pid: 10, ppid: 1, command: '/bin/bash -lc git status',
+    argv: ['/bin/bash', '-lc', 'git status'], cwd: '/workspace', timestamp: 1_700_000_000_042,
+    start_time_ns: null, call_marker: null,
   });
+});
+
+test('toExecutionEvent carries RAYTRACE_CALL_ID through, and ignores other markers', () => {
+  const marked = { ...exec(7, 10, 1, ['ls']), markers: { RAYTRACE_CALL_ID: 'call_abc', RAYTRACE_SESSION: 'rtp-x' } };
+  assert.equal(toExecutionEvent(marked).call_marker, 'call_abc');
+  // A session marker alone is not a per-call join; it must not become one.
+  assert.equal(toExecutionEvent({ ...exec(8, 10, 1, ['ls']), markers: { RAYTRACE_SESSION: 'rtp-x' } }).call_marker, null);
+  assert.equal(toExecutionEvent({ ...exec(9, 10, 1, ['ls']), markers: { RAYTRACE_CALL_ID: '' } }).call_marker, null);
 });
 
 test('toExecutionEvent rejects anything that is not a usable exec', () => {
@@ -54,24 +64,66 @@ function fakeIngest(matchIf) {
   return { ingest, calls };
 }
 
-test('a top-level bash -lc exec is forwarded, scoped to the sandbox session, and its children are skipped', async () => {
+test('a top-level bash -lc exec is forwarded and scoped to the sandbox session; its children are recorded, not matched', async () => {
   const { ingest, calls } = fakeIngest(['git status']);
   const finished = [];
+  const descended = [];
   const tracker = new SandboxTracker();
   const counts = await processEvents([
     exec(1, 100, 1, ['/bin/bash', '-lc', 'git status']),
-    exec(2, 101, 100, ['git', 'status']),        // child of the matched bash: must not be considered
-    exit(3, 101, 0),                              // child exit: not ours to close
+    exec(2, 101, 100, ['git', 'status']),        // child of the matched bash: never offered to the matcher
+    exit(3, 101, 0),                              // child exit: closes the CHILD's own row
     exit(4, 100, 0),                              // the command itself finishing
-  ], { sessionId: SESSION, tracker, ingest, finish: async (row) => { finished.push(row); return true; } });
+  ], { sessionId: SESSION, tracker, ingest, finish: async (row) => { finished.push(row); return true; },
+       descend: async (row) => { descended.push(row); } });
 
-  assert.deepEqual(counts, { forwarded: 1, matched: 1, finished: 1 });
-  assert.equal(calls.length, 1);
+  assert.deepEqual(counts, { forwarded: 1, matched: 1, finished: 2, descendants: 1, unattributed: 0 });
+  assert.equal(calls.length, 1, 'only the top-level exec reached the matcher');
   assert.equal(calls[0].opts.sessionId, SESSION);
   assert.equal(calls[0].events[0].command, '/bin/bash -lc git status');
-  assert.deepEqual(finished, [{ id: `gvisor-${'c'.repeat(12)}-1`, ended_at: new Date(1_700_000_000_004).toISOString(), status: 'completed', error: null }]);
+
+  // The child is stored against the call its parent resolved to.
+  assert.equal(descended.length, 1);
+  assert.equal(descended[0].parent_call_id, `call-for-gvisor-${'c'.repeat(12)}-1`);
+  assert.equal(descended[0].tier, 'corroborated');
+  assert.equal(descended[0].exec.pid, 101);
+
+  // Each pid closes its OWN row -- a child's exit must never finish its parent.
+  assert.deepEqual(finished.map((r) => r.id), [`gvisor-${'c'.repeat(12)}-2`, `gvisor-${'c'.repeat(12)}-1`]);
   assert.equal(tracker.cursor, 4);
-  assert.equal(tracker.live.size, 0, 'exit released the pid');
+  assert.equal(tracker.live.size, 0, 'exits released both pids');
+});
+
+test('a grandchild inherits attribution: the one-level check never reached it', async () => {
+  // npm test -> sh -c node -e "...unlinkSync" -> node. The deletion is two
+  // levels down; before this it fell past the parent check into the matcher,
+  // scored too low against every candidate, and was discarded.
+  const { ingest } = fakeIngest(['npm test']);
+  const descended = [];
+  const tracker = new SandboxTracker();
+  const counts = await processEvents([
+    exec(1, 265, 156, ['/bin/bash', '-lc', 'npm test']),
+    exec(2, 277, 265, ['sh', '-c', 'node -e "require(\'fs\').unlinkSync(\'keep.txt\')"']),
+    exec(3, 278, 277, ['node', '-e', "require('fs').unlinkSync('keep.txt')"]),
+  ], { sessionId: SESSION, tracker, ingest, finish: async () => true, descend: async (row) => { descended.push(row); } });
+
+  assert.equal(counts.descendants, 2);
+  const call = `call-for-gvisor-${'c'.repeat(12)}-1`;
+  assert.deepEqual(descended.map((r) => [r.exec.pid, r.parent_call_id]), [[277, call], [278, call]]);
+});
+
+test('an exec that matches nothing is recorded as unattributed rather than discarded', async () => {
+  const { ingest } = fakeIngest([]);   // nothing matches
+  const descended = [];
+  const tracker = new SandboxTracker();
+  const counts = await processEvents([
+    exec(1, 900, 1, ['curl', 'https://example.com']),
+  ], { sessionId: SESSION, tracker, ingest, finish: async () => true, descend: async (row) => { descended.push(row); } });
+
+  assert.deepEqual(counts, { forwarded: 1, matched: 0, finished: 0, descendants: 0, unattributed: 1 });
+  assert.equal(descended.length, 1);
+  assert.equal(descended[0].parent_call_id, null, 'belongs to no proposed call');
+  assert.equal(descended[0].tier, 'unverified');
 });
 
 test('a same-pid re-exec (bash exec()ing its last command) is not offered as a separate candidate', async () => {
@@ -93,9 +145,9 @@ test('unmatched execs never occupy a pid, so their children remain eligible', as
     exec(1, 1, 0, ['codex']),
     exec(2, 50, 1, ['/bin/bash', '-lc', 'npm test']),
   ], { sessionId: SESSION, tracker, ingest, finish: async () => true });
-  assert.deepEqual(counts, { forwarded: 2, matched: 1, finished: 0 });
+  assert.deepEqual(counts, { forwarded: 2, matched: 1, finished: 0, descendants: 0, unattributed: 1 });
   assert.equal(calls.length, 2);
-  assert.equal(tracker.live.get(50), `gvisor-${'c'.repeat(12)}-2`);
+  assert.equal(tracker.live.get(50).execId, `gvisor-${'c'.repeat(12)}-2`);
   assert.equal(tracker.live.has(1), false);
 });
 
@@ -129,8 +181,9 @@ test('events are processed in id order regardless of page order, and only past t
 test('malformed pages and events never throw', async () => {
   const tracker = new SandboxTracker();
   const deps = { sessionId: SESSION, tracker, ingest: async () => new Map(), finish: async () => true };
-  assert.deepEqual(await processEvents(undefined, deps), { forwarded: 0, matched: 0, finished: 0 });
-  assert.deepEqual(await processEvents([null, {}, { kind: 'exec_succeeded' }, { event_id: 'x', kind: 'process_exit' }], deps), { forwarded: 0, matched: 0, finished: 0 });
+  const none = { forwarded: 0, matched: 0, finished: 0, descendants: 0, unattributed: 0 };
+  assert.deepEqual(await processEvents(undefined, deps), none);
+  assert.deepEqual(await processEvents([null, {}, { kind: 'exec_succeeded' }, { event_id: 'x', kind: 'process_exit' }], deps), none);
 });
 
 test('startGvisorForwarder discovers sandboxes from the manager and tails each container from the viewer', async () => {
@@ -144,6 +197,8 @@ test('startGvisorForwarder discovers sandboxes from the manager and tails each c
         { id: 'rtp-' + 'b'.repeat(32), container_id: null },     // no container yet: ignored
       ] };
     }
+    // limit=1 is the cursor seed probe; this container has no history yet.
+    if (url.includes('limit=1')) return { ok: true, json: async () => ({ events: [], next_before: null }) };
     if (url.includes('/events?')) return { ok: true, json: async () => ({ events: [exec(1, 5, 1, ['/bin/bash', '-lc', 'pwd']), exit(2, 5, 0)], next_before: null }) };
     throw new Error('unexpected ' + url);
   };
@@ -156,7 +211,7 @@ test('startGvisorForwarder discovers sandboxes from the manager and tails each c
     assert.equal(forwarder.sandboxes.size, 1);
     assert.equal(forwarder.sandboxes.get(CONTAINER).sessionId, SESSION);
     await forwarder.poll();
-    const viewerUrl = requested.find((u) => u.includes('/events?'));
+    const viewerUrl = requested.find((u) => u.includes('limit=500'));
     assert.match(viewerUrl, new RegExp(`container=${CONTAINER}&after=0&limit=500&processes=1`));
     assert.equal(finished.length, 1);
     assert.equal(forwarder.sandboxes.get(CONTAINER).tracker.cursor, 2);
@@ -165,6 +220,42 @@ test('startGvisorForwarder discovers sandboxes from the manager and tails each c
     // A second poll asks from the advanced cursor.
     await forwarder.poll();
     assert.ok(requested.some((u) => u.includes('&after=2&')));
+  } finally { forwarder.stop(); }
+});
+
+test('a newly discovered sandbox starts at the newest event, not at zero', async () => {
+  // The collector's evidence store lives in the VM and is append-only, so it
+  // outlives the proxy. Beginning at 0 re-reads every past session: none of it
+  // can match (no proposed calls were captured then), so it all lands as
+  // unattributed rows and pushes the live session behind days of backlog.
+  const requested = [];
+  const fetchImpl = async (url) => {
+    requested.push(url);
+    if (url.endsWith('/api/projects')) return { ok: true, json: async () => [{ id: SESSION, container_id: CONTAINER }] };
+    if (url.includes('limit=1')) return { ok: true, json: async () => ({ events: [exec(4096, 9, 1, ['old', 'history'])] }) };
+    return { ok: true, json: async () => ({ events: [] }) };
+  };
+  const logs = [];
+  const forwarder = startGvisorForwarder({ ingest: async () => new Map(), finish: async () => true, fetchImpl, log: (m) => logs.push(m), pollMs: 60_000, discoverMs: 60_000 });
+  try {
+    await forwarder.discover();
+    assert.equal(forwarder.sandboxes.get(CONTAINER).tracker.cursor, 4096, 'seeded past the backlog');
+    await forwarder.poll();
+    assert.ok(requested.some((u) => u.includes('&after=4096&')), 'tails forward from there');
+    assert.ok(logs.some((m) => m.includes('from event 4096')));
+  } finally { forwarder.stop(); }
+});
+
+test('an unreachable viewer during discovery falls back to replaying rather than skipping evidence', async () => {
+  const fetchImpl = async (url) => {
+    if (url.endsWith('/api/projects')) return { ok: true, json: async () => [{ id: SESSION, container_id: CONTAINER }] };
+    throw new Error('ECONNREFUSED');
+  };
+  const forwarder = startGvisorForwarder({ ingest: async () => new Map(), finish: async () => true, fetchImpl, log: () => {}, pollMs: 60_000, discoverMs: 60_000 });
+  try {
+    await forwarder.discover();
+    // Over-inclusive is recoverable; starting blind loses evidence silently.
+    assert.equal(forwarder.sandboxes.get(CONTAINER).tracker.cursor, 0);
   } finally { forwarder.stop(); }
 });
 
