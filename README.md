@@ -81,18 +81,46 @@ The gVisor prototype uses a dedicated Lima Linux VM and Docker. It is currently
 an optional development feature, not a security certification or immutable audit
 boundary.
 
-On macOS or Linux with Lima and Docker available:
+On macOS or Linux with Lima and Docker available, set the VM up once:
 
 ```sh
 npm run sandbox:setup
-npm run sandbox:run -- -- /bin/bash
 ```
 
-Keep the proxy and sandbox manager running when using sandbox evidence:
+After that, one command starts everything and opens an agent session in the
+sandbox:
+
+```sh
+npm run dev:all
+```
+
+It checks the environment first (Node version, `.env`, the Lima VM, the VM's
+collector and viewer, the gVisor runtime, and each port), starts the proxy,
+sandbox manager and dashboard detached, then opens Codex inside the sandbox for
+this workspace. A sandbox is matched to the repository you run it from; a
+repository with no sandbox yet gets one imported and approved.
+
+Services write to `.raytace/logs/{proxy,sandbox,dev,watch}.log` and are kept
+alive by a watcher: if one dies, the death and the restart are recorded in that
+service's own log rather than leaving the dashboard silently empty.
+
+```sh
+npm run dev:all -- --status     # what is alive
+npm run dev:all -- --stop       # stop the services and the watcher
+npm run dev:all -- --no-codex   # services only
+npm run dev:all -- rtp-<id>     # a specific sandbox
+```
+
+`--stop` frees ports 8797, 8799 and 3000, including a process holding one that
+this script did not start.
+
+The pieces can still be run by hand — useful when something needs starting
+individually:
 
 ```sh
 npm run proxy
 npm run sandbox:manager
+npm run sandbox:run -- -- /bin/bash
 ```
 
 See [`worker/gvisor/README.md`](worker/gvisor/README.md) for isolation details,
@@ -138,6 +166,7 @@ development services.
 ## Development commands
 
 ```sh
+npm run dev:all      # Doctor, start every service, open the sandbox agent
 npm run dev          # Start the dashboard
 npm run proxy        # Start the local capture proxy
 npm run build        # Build the dashboard
