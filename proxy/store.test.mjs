@@ -183,6 +183,87 @@ test('recordExecution without match_score/match_basis defaults them to null (old
   assert.equal(call.match_basis, null);
 }));
 
+test('recordDescendant stores a process that ran underneath a call, without claiming to BE that call', () => withStore((store) => {
+  store.recordExchange(exchange('s1', [], [{ type: 'function_call', call_id: 'c1', name: 'exec_command', arguments: { command: 'npm test' } }]));
+  store.recordExecution({ id: 'gvisor-1', call_id: 'c1', status: 'completed', pid: 265, match_basis: 'text', tier: 'inferred' });
+  // The pretest hook: gVisor saw it, it belongs to c1, but nobody proposed it.
+  store.recordDescendant({ id: 'gvisor-2', parent_call_id: 'c1', pid: 278, ppid: 277, status: 'completed',
+    argv: ['node', '-e', "require('fs').unlinkSync('keep.txt')"] });
+
+  const rows = store.db.prepare('SELECT call_id, parent_call_id, tier, pid, ppid, argv FROM tool_executions ORDER BY pid').all();
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].call_id, 'c1');
+  assert.equal(rows[0].parent_call_id, null);
+  assert.equal(rows[0].pid, 265);
+  assert.equal(rows[1].call_id, null);            // a descendant is not the proposed call
+  assert.equal(rows[1].parent_call_id, 'c1');
+  assert.equal(rows[1].tier, 'corroborated');
+  assert.deepEqual(JSON.parse(rows[1].argv), ['node', '-e', "require('fs').unlinkSync('keep.txt')"]);
+
+  // divergence() joins on call_id, so descendants never inflate a call's own verdict.
+  const calls = store.divergence(['s1']);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].outcome, 'as_proposed');
+}));
+
+test('an execution attributed to nothing is storable (both keys null) — the case 005 exists for', () => withStore((store) => {
+  store.recordExchange(exchange('s1', [], [{ type: 'function_call', call_id: 'c1', name: 'exec_command', arguments: { command: 'ls -la' } }]));
+  store.recordDescendant({ id: 'gvisor-9', parent_call_id: null, tier: 'unverified', pid: 999, ppid: 156,
+    argv: ['curl', 'https://example.com'], status: 'completed' });
+
+  const orphans = store.db.prepare('SELECT pid, tier, argv FROM tool_executions WHERE call_id IS NULL AND parent_call_id IS NULL').all();
+  assert.equal(orphans.length, 1);
+  assert.equal(orphans[0].pid, 999);
+  assert.equal(orphans[0].tier, 'unverified');
+  // The proposed call is untouched: an unattributed exec is not evidence FOR it.
+  assert.equal(store.divergence(['s1'])[0].outcome, 'not_executed');
+}));
+
+test('descendants() returns the subtree divergence() structurally cannot see', () => withStore((store) => {
+  store.recordExchange(exchange('s1', [], [{ type: 'function_call', call_id: 'c1', name: 'exec_command', arguments: { command: 'npm test' } }]));
+  store.recordExecution({ id: 'g1', call_id: 'c1', status: 'completed', pid: 265 });
+  store.recordDescendant({ id: 'g2', parent_call_id: 'c1', pid: 277, ppid: 265, started_at: '2026-01-01T00:00:02.000Z', argv: ['sh', '-c', 'node -e ...'], status: 'completed' });
+  store.recordDescendant({ id: 'g3', parent_call_id: 'c1', pid: 278, ppid: 277, started_at: '2026-01-01T00:00:03.000Z', argv: ['node', '-e', "require('fs').unlinkSync('keep.txt')"], status: 'completed' });
+  // An unattributed row is not part of any call's subtree.
+  store.recordDescendant({ id: 'g4', parent_call_id: null, tier: 'unverified', pid: 999, started_at: '2026-01-01T00:00:04.000Z', argv: ['curl', 'x'] });
+
+  const tree = store.descendants(['s1']);
+  assert.deepEqual(tree.map((r) => r.pid), [277, 278], 'ordered by start, orphan excluded');
+  assert.deepEqual(tree[1].argv, ['node', '-e', "require('fs').unlinkSync('keep.txt')"], 'argv comes back parsed');
+  assert.equal(tree[0].parent_call_id, 'c1');
+
+  // The call's own verdict is unchanged by what ran underneath it, but it
+  // reports how much there is so the UI can offer the subtree.
+  const [call] = store.divergence(['s1']);
+  assert.equal(call.outcome, 'as_proposed');
+  assert.equal(call.descendant_count, 2);
+}));
+
+test('unattributed() finds executions belonging to no call, windowed by time', () => withStore((store) => {
+  store.recordExchange(exchange('s1', [], [{ type: 'function_call', call_id: 'c1', name: 'exec_command', arguments: { command: 'ls' } }]));
+  store.recordExecution({ id: 'attributed', call_id: 'c1', status: 'completed', started_at: '2026-01-01T00:00:05.000Z' });
+  store.recordDescendant({ id: 'child', parent_call_id: 'c1', pid: 100, started_at: '2026-01-01T00:00:06.000Z', argv: ['sh'] });
+  store.recordDescendant({ id: 'orphan-jan1', parent_call_id: null, tier: 'unverified', pid: 999, argv: ['curl', 'https://example.com'], started_at: '2026-01-01T00:00:10.000Z' });
+  store.recordDescendant({ id: 'orphan-jan2', parent_call_id: null, tier: 'unverified', pid: 998, argv: ['wget', 'x'], started_at: '2026-01-02T00:00:00.000Z' });
+
+  const jan1 = Date.parse('2026-01-01T00:00:00.000Z');
+  const inWindow = store.unattributed({ sinceMs: jan1, untilMs: jan1 + 60_000 });
+  assert.deepEqual(inWindow.map((r) => r.id), ['orphan-jan1'], 'neither the attributed row nor the child nor the next day');
+  assert.deepEqual(inWindow[0].argv, ['curl', 'https://example.com']);
+
+  assert.equal(store.unattributed({}).length, 2, 'an open window finds both orphans');
+}));
+
+test('recordExecution derives tier from match_basis when the caller does not set one', () => withStore((store) => {
+  store.recordExchange(exchange('s1', [], [{ type: 'function_call', call_id: 'c1', name: 'exec_command', arguments: { command: 'ls' } }]));
+  store.recordExchange(exchange('s2', [], [{ type: 'function_call', call_id: 'c2', name: 'exec_command', arguments: { command: 'pwd' } }]));
+  store.recordExecution({ id: 'e1', call_id: 'c1', status: 'completed', match_basis: 'id' });     // exact join
+  store.recordExecution({ id: 'e2', call_id: 'c2', status: 'completed', match_basis: 'text' });   // a guess
+  const tiers = Object.fromEntries(store.db.prepare('SELECT id, tier FROM tool_executions').all().map((r) => [r.id, r.tier]));
+  assert.equal(tiers.e1, 'mediated');
+  assert.equal(tiers.e2, 'inferred');
+}));
+
 test('re-recording an exchange replaces it instead of duplicating', () => withStore((store) => {
   store.recordExchange(exchange('s1', [{ role: 'user', type: 'message', content: 'first' }]));
   store.recordExchange(exchange('s1', [{ role: 'user', type: 'message', content: 'first' }]));
@@ -212,7 +293,7 @@ test('migrations apply once and reopening is safe', async () => {
   first.close();
   const second = openStore(file);                       // must not re-run 001_init
   assert.equal(second.exchangeRows({}).length, 1);
-  assert.equal(second.db.prepare('PRAGMA user_version').get().user_version, 4); // 001_init + 002_summaries + 003_execution_confidence + 004_kernel_verification
+  assert.equal(second.db.prepare('PRAGMA user_version').get().user_version, 6); // 001_init + 002_summaries + 003_execution_confidence + 004_kernel_verification + 005_execution_provenance + 006_command_descriptions
   second.close();
   await rm(dir, { recursive: true, force: true });
 });

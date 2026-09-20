@@ -29,6 +29,35 @@ export type CallVerification = {
    * bpftrace sidecar in container mode) saw this program start, independent
    * of anything the agent logged about itself. */
   kernel_confirmed?: boolean;
+  tier?: Tier | null;
+  descendant_count?: number;
+};
+
+/** How an execution was attributed to the call it appears under, recorded at
+ * capture and never recomputed by a later join — see
+ * proxy/migrations/005_execution_provenance.sql.
+ *
+ *  mediated     the call id travelled with the process (RAYTRACE_CALL_ID)
+ *  corroborated a text match an independent kernel witness also saw
+ *  inferred     a command-text match inside a time window, nothing more
+ *  unverified   it ran; it matched no proposed call
+ */
+export type Tier = 'mediated' | 'corroborated' | 'inferred' | 'unverified';
+
+/** One process that ran underneath a proposed call — npm test's pretest hook,
+ * and whatever that spawned. Never a proposed call itself: nothing in
+ * `tool_calls` corresponds to it, which is why these were discarded before
+ * migration 005 gave them a row shape. */
+export type Descendant = {
+  id: string;
+  tier: Tier;
+  pid: number | null;
+  ppid: number | null;
+  argv: string[];
+  status: string | null;
+  error: string | null;
+  started_at: string | null;
+  ended_at: string | null;
 };
 
 export type SummaryState = { status: 'loading' } | { status: 'ready'; text: string } | { status: 'error' };
@@ -80,6 +109,12 @@ export type ContextItem = {
   match_basis?: 'id' | 'text' | null;
   source?: string | null;
   kernel_confirmed?: boolean;
+  /** Attribution strength for this call's own execution row. */
+  tier?: Tier | null;
+  /** Processes that ran underneath this call — empty until a collector that
+   * records them has run (the gVisor forwarder; see step 3). */
+  descendants?: Descendant[];
+  descendant_count?: number;
 };
 
 export type Outcome = { key: string; label: string; calls: { name: string; arguments: unknown }[]; text: string };

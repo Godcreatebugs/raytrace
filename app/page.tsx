@@ -3,7 +3,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { Braces, ChevronRight, FileCode2, FlaskConical, GitBranch, MessagesSquare, Search, TerminalSquare, Waypoints, Workflow } from 'lucide-react';
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select';
-import { type ContextItem, type Origin, type Snapshot, type Trace, type SummaryState, type TraceBlock } from './types';
+import { type ContextItem, type Descendant, type Origin, type Snapshot, type Trace, type SummaryState, type TraceBlock } from './types';
 
 import { DecisionLab } from './decision-lab';
 import { RequestMetrics, money, duration, count as tokenCount } from './request-metrics';
@@ -14,6 +14,27 @@ import { isCompletion, completionFailed, isAction, lastActionIndex } from './tra
 
 const PROXY_BASE = 'http://127.0.0.1:8797';
 const icons = { model: Braces, search: Search, read: FileCode2, edit: GitBranch, test: TerminalSquare };
+
+/** The processes a call actually spawned. Nobody proposed any of these — a
+ * `pretest` hook that deletes a file is as invisible in the tool call as it
+ * is consequential — so this is collapsed by default and says how many there
+ * are, rather than either hiding them or burying the call itself. */
+function DescendantTree({ items }: { items: Descendant[] }) {
+  if (!items.length) return null;
+  const failed = items.filter((child) => child.status === 'failed').length;
+  return <details className="raw-details descendant-tree">
+    <summary>{items.length} process{items.length === 1 ? '' : 'es'} ran underneath{failed ? ` · ${failed} failed` : ''}</summary>
+    <ul className="descendant-list">
+      {items.map((child) => <li key={child.id} className={child.status === 'failed' ? 'descendant failed' : 'descendant'}>
+        <code>{child.argv.join(' ') || '(no argv recorded)'}</code>
+        <span className="descendant-meta" title={`pid ${child.pid}, started by pid ${child.ppid}`}>
+          pid {child.pid}{child.error ? ` · ${child.error}` : ''}
+        </span>
+      </li>)}
+    </ul>
+    <p className="chain-note">Observed by the kernel layer, not proposed by the model. Nothing here appears in the tool call above.</p>
+  </details>;
+}
 
 
 export default function Home() {
@@ -153,11 +174,28 @@ export default function Home() {
   // divergence-overlay step in raytace-proxy.mjs.
   function verifyBadge(item: ContextItem): { label: string; title: string; kind: 'kernel' | 'exact' | 'fuzzy' | 'unconfirmed' | 'heuristic' } | null {
     if (item.verified === true) {
-      // Strongest tier: the layer that mediated the syscall (gVisor in the
-      // sandbox, or the bpftrace sidecar in container mode) saw this program
-      // start. Proves it ran, not that its output or the answer is correct.
+      const running = item.real_status === 'running';
+      // `tier` is recorded at capture (migration 005) and is the honest
+      // answer. Before it, every sandbox row rendered as "Sandbox-verified"
+      // whether the join was an exact call-id match or a string-similarity
+      // score above 0.6 — the badge claimed mediation for what was a guess.
+      // Rows captured before 005 have no tier and fall through to the old
+      // kernel_confirmed/match_basis logic below.
+      switch (item.tier) {
+        case 'mediated':
+          return { label: running ? 'Exact match: running' : 'Exact match', kind: 'kernel', title: running
+            ? 'The call ID travelled with this process, so the join is exact. It has not exited yet, so success/failure is not known.'
+            : 'The call ID travelled with this process (RAYTRACE_CALL_ID), so this is the command the model proposed — not a text match. Proves it ran, not that its output is correct.' };
+        case 'corroborated':
+          return { label: running ? 'Sandbox: running' : 'Sandbox-corroborated', kind: 'exact', title: running
+            ? 'gVisor saw this command start inside the sandbox; it has not exited yet, so success/failure is not known.'
+            : 'A kernel-level witness saw this command run, and its text matches what the model proposed. The link between the two is a similarity match, not an exact join.' };
+        case 'inferred':
+          return { label: 'Text match only', kind: 'fuzzy', title: 'Matched to this call by command-text similarity inside a ±30s window. No independent witness confirmed it, and a wrong match is possible.' };
+        case 'unverified':
+          return { label: 'Ran, unattributed', kind: 'unconfirmed', title: 'A process ran, but it matched no proposed call. Either the correlator failed or nothing proposed it.' };
+      }
       if (item.kernel_confirmed) {
-        const running = item.real_status === 'running';
         return { label: running ? 'Sandbox: running' : 'Sandbox-verified', title: running
           ? 'gVisor saw this command start inside the sandbox; it has not exited yet, so success/failure is not known.'
           : 'gVisor observed this command start (and exit) inside the sandbox, independent of agent logs. Proves it ran, not that its output is correct.', kind: 'kernel' };
@@ -222,7 +260,18 @@ export default function Home() {
       <div className="trace-meta"><span>{trace?.provider || '—'}</span><span>{trace?.model || 'Awaiting capture'}</span><span>{actionCount} steps</span></div>
       <div className="compare-entry"><RunComparison traces={traces} currentId={traceId}/>{trace && <button type="button" className={`visualize-button ${view === 'graph' ? 'active' : ''}`} onClick={() => setView(view === 'graph' ? 'prompts' : 'graph')}><Workflow size={14}/> {view === 'graph' ? 'Back to timeline' : 'Visualize'}</button>}</div>
       <RequestMetrics requests={trace?.requests}/>
-      {trace && <RuntimeEvidence key={trace.id} sandboxId={trace.sandboxId}/>}
+      {trace && (() => {
+        // A trace IS one prompt (groupPromptExchanges in prompt-traces.mjs),
+        // so its first request start to its last response end is exactly the
+        // turn: from what you asked to what the agent answered. Without this
+        // window the panel shows every command ever run in the sandbox.
+        const times = (trace.requests ?? []).flatMap((r) => [Date.parse(r.startedAt), r.completedAt ? Date.parse(r.completedAt) : NaN]).filter(Number.isFinite);
+        // A second of slack each side: a process can start just before the
+        // request is logged and exit just after the response lands.
+        const since = times.length ? Math.min(...times) - 1000 : undefined;
+        const until = times.length ? Math.max(...times) + 1000 : undefined;
+        return <RuntimeEvidence key={trace.id} sandboxId={trace.sandboxId} since={since} until={until} prompt={trace.title}/>;
+      })()}
       {view === 'graph' && trace && <TraceGraph trace={trace} blocks={blocks} summaries={summaries} onSelectStep={(index) => { setSelected(index); setView('prompts'); }}/>}
       {view === 'prompts' && <><div className="timeline-head"><span>OBSERVED EXECUTION SEQUENCE</span></div>
       <div className="timeline">{blocks.length ? blocks.map((block, blockPosition) => {
@@ -289,7 +338,7 @@ export default function Home() {
           <ol className="chain-graph-list">
             {userAsk && <li className="chain-node user"><span className="chain-dot"/><div><strong>User asked</strong><p>{userAsk.preview.slice(0, 120)}</p></div></li>}
             {collapsedCount > 0 && <li className="chain-node collapsed"><span className="chain-dot"/><div><p>{collapsedCount} earlier tool steps collapsed — they remain testable in the lab.</p></div></li>}
-            {shownResults.map((item) => { const output = nodeOutput(item); const badge = verifyBadge(item); return <li key={item.id} className={`chain-node ${item.succeeded === false ? 'failed' : ''}`}><span className="chain-dot"/><div><div className="chain-node-head"><strong>{nodeWhy(item)}</strong>{badge && <span className={`verify-badge verify-${badge.kind}`} title={badge.title}>{badge.label}</span>}{typeof item.match_score === 'number' && <span className="chain-node-score" title={`Match basis: ${item.match_basis === 'id' ? 'exact call ID' : 'command text similarity'}`}>{item.match_score.toFixed(2)}</span>}</div>{output && <p className="chain-output">→ {output}</p>}{item.real_error && <p className="chain-output verify-error">{item.real_error}</p>}{item.origin && (() => { const turn = turnInfo(item); const rel = relativeTime(originTimestamp(item.origin!)); return <button type="button" className={`link-button turn-link ${turn?.kind === 'carried' ? 'turn-carried' : 'turn-fresh'}`} onClick={() => jumpToOrigin(item.origin!)} title="Jump to the request that originally proposed this call">{turn ? `${turn.label} · ${rel}` : `Open the exchange that proposed this (${rel})`}</button>; })()}</div></li>; })}
+            {shownResults.map((item) => { const output = nodeOutput(item); const badge = verifyBadge(item); return <li key={item.id} className={`chain-node ${item.succeeded === false ? 'failed' : ''}`}><span className="chain-dot"/><div><div className="chain-node-head"><strong>{nodeWhy(item)}</strong>{badge && <span className={`verify-badge verify-${badge.kind}`} title={badge.title}>{badge.label}</span>}{typeof item.match_score === 'number' && <span className="chain-node-score" title={`Match basis: ${item.match_basis === 'id' ? 'exact call ID' : 'command text similarity'}`}>{item.match_score.toFixed(2)}</span>}</div>{output && <p className="chain-output">→ {output}</p>}{item.real_error && <p className="chain-output verify-error">{item.real_error}</p>}<DescendantTree items={item.descendants ?? []}/>{item.origin && (() => { const turn = turnInfo(item); const rel = relativeTime(originTimestamp(item.origin!)); return <button type="button" className={`link-button turn-link ${turn?.kind === 'carried' ? 'turn-carried' : 'turn-fresh'}`} onClick={() => jumpToOrigin(item.origin!)} title="Jump to the request that originally proposed this call">{turn ? `${turn.label} · ${rel}` : `Open the exchange that proposed this (${rel})`}</button>; })()}</div></li>; })}
             <li className="chain-node decision"><span className="chain-dot"/><div><strong>Decision</strong><p>{snapshot.decision?.label || 'No completed decision captured for this exchange.'}</p>{snapshot.decision?.text && <details className="raw-details decision-details"><summary>Show full answer</summary><p className="chain-output decision-answer">{snapshot.decision.text}</p></details>}</div></li>
           </ol>
         </div>}

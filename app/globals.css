@@ -17,6 +17,16 @@
 .verify-badge.verify-fuzzy{color:#e3c368;background:#241f10;border:1px solid #5c4e23}
 .verify-badge.verify-unconfirmed{color:#8ea0ba;background:#131c29;border:1px solid #2a3951}
 .chain-node-score{margin-left:auto;padding-left:10px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#75829a;flex:none;cursor:default}
+/* Processes that ran underneath a call. Deliberately quiet until opened --
+   most calls spawn something, and a loud tree on every node would bury the
+   calls themselves. A failed child is the one thing worth colouring. */
+.descendant-tree{margin-top:6px}
+.descendant-tree>summary{font-size:11px;color:#75829a}
+.descendant-list{list-style:none;margin:6px 0 0;padding:0 0 0 10px;border-left:1px solid #26303f}
+.descendant-list .descendant{display:flex;gap:8px;align-items:baseline;padding:2px 0;flex-wrap:wrap}
+.descendant-list .descendant code{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#b9c4d4;word-break:break-all}
+.descendant-list .descendant.failed code{color:#e39a9a}
+.descendant-meta{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;color:#5c6d87;white-space:nowrap}
 .turn-link{display:inline-block;margin-top:2px}
 .turn-link.turn-fresh{color:#5c6d87;font-weight:500;text-decoration:none}
 .turn-link.turn-fresh:hover{text-decoration:underline}
@@ -44,3 +54,46 @@
 .graph-node-meta{display:flex;gap:8px;flex-wrap:wrap;font-size:10px;color:#8290a8}
 .graph-node-verified-all{color:#66d6a8}
 .graph-node-verified-partial{color:#e3c368}
+
+/* Sandbox evidence: a sequence of what ran, not a table of raw events. The
+   folded line and the per-step "command" toggle are what keep it honest --
+   nothing is hidden, only folded, and the fold says how much it folded. */
+.evidence-panel{margin:16px 0;padding:16px;border:1px solid #26303f;border-radius:8px}
+.evidence-panel>summary{font-weight:600;cursor:pointer}
+.evidence-prompt{color:#75829a;font-size:12px;margin:6px 0}
+.evidence-list{list-style:none;margin:10px 0;padding:0}
+.evidence-step{display:flex;align-items:baseline;gap:10px;padding:3px 0;flex-wrap:wrap}
+.evidence-node{list-style:none}
+.evidence-node>details>summary{cursor:pointer;border-radius:4px}
+.evidence-node>details>summary:hover{background:#121a26}
+/* display:flex on the summary suppresses the native marker, so the caret is
+   drawn explicitly -- a row that opens has to look like one. */
+.evidence-node>details>summary::marker,
+.evidence-node>details>summary::-webkit-details-marker{display:none;content:''}
+.evidence-node>details>summary::before{content:'▸';color:#4c5a70;font-size:9px;flex:none;width:9px}
+.evidence-node>details[open]>summary::before{content:'▾'}
+/* Leaves get the caret's width back as blank space so every row in a list
+   starts at the same column. */
+li.evidence-step::before{content:'';flex:none;width:9px}
+/* Nesting is the tree's own indentation, not an inline margin per row. */
+.evidence-children{margin:2px 0 6px;padding-left:20px;border-left:1px solid #1e2937}
+.evidence-ordinal{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#4c5a70;flex:none;min-width:14px}
+.evidence-step.failed .evidence-what{color:#e39a9a}
+.evidence-time{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#5c6d87;flex:none}
+.evidence-what{color:#d5dce6}
+.evidence-what code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#b9c4d4;word-break:break-all}
+.evidence-ai,.evidence-nodesc{margin-left:6px;font-size:9px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;padding:1px 5px;border-radius:999px;cursor:default}
+.evidence-ai{color:#c9a6e8;background:#1d1528;border:1px solid #453059}
+.evidence-nodesc{color:#8ea0ba;background:#131c29;border:1px solid #2a3951}
+.evidence-exit{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;color:#5c6d87}
+.evidence-exit.failed{color:#e39a9a}
+.evidence-argv{flex-basis:100%;margin-left:0}
+/* Inside a node, the disclosure sits beside its row rather than a flex line
+   below it, so it needs the caret's width back to line up. */
+.evidence-node>details>.evidence-argv{padding-left:19px}
+.evidence-argv>summary{font-size:10px;color:#4c5a70;cursor:pointer}
+.evidence-argv code{display:block;margin-top:4px;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#8ea0ba;white-space:pre-wrap;overflow-wrap:anywhere}
+.evidence-folded{border-top:1px solid #1e2734;padding-top:8px}
+.evidence-raw{list-style:none;margin:10px 0;padding:0;max-height:420px;overflow-y:auto}
+.evidence-raw li{padding:2px 0;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.evidence-raw code{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#8ea0ba;word-break:break-all}

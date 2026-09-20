@@ -211,13 +211,24 @@ def serve():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['serve', 'import', 'open', 'list'])
+    parser.add_argument('action', choices=['serve', 'import', 'open', 'list', 'approve'])
     parser.add_argument('target', nargs='?')
     args = parser.parse_args()
     if args.action == 'serve': serve()
     elif args.action == 'import':
         r = create(args.target or os.getcwd())
         print('Imported '+str(len(r['manifest']))+' files. Resume: npm run sandbox:open -- '+r['id'])
+    elif args.action == 'approve':
+        # Same grant the web UI's approve-proxy button makes, reachable without
+        # it. That endpoint is gated on a CSRF token serve() mints per run and
+        # embeds only in the HTML page -- never written to disk -- so a script
+        # would have to scrape the page to use it. This runs locally with the
+        # same trust as `import` and reuses project_broker.approve() unchanged.
+        if not args.target: raise SystemExit('Usage: npm run sandbox:approve -- rtp-<id>')
+        r = record_for(args.target)
+        if r['status'] == 'deleted': raise SystemExit('Sandbox was deleted')
+        project_broker.approve(r, save, VM)
+        print('Approved proxy access for ' + r['id'])
     elif args.action == 'open':
         r=record_for(args.target)
         r['last_activity']=time.time();save(r)

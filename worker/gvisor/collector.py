@@ -17,6 +17,25 @@ import uuid
 
 MAX_PACKET = 1024 * 1024
 
+# The ONLY environment variables ever read off a traced process. `envv` is
+# requested on the execve points (see setup.py) purely to carry these two
+# markers, which turn tool-call correlation from a text-similarity guess into
+# an exact join. Everything else in the environment block -- API keys, tokens,
+# database passwords -- is dropped here, before any write, and the raw packet
+# is withheld for events that carried one (see decode). Never widen this list.
+MARKER_KEYS = ('RAYTRACE_CALL_ID', 'RAYTRACE_SESSION')
+
+
+def markers(entries):
+    """Pick the allowlisted markers out of a raw `envv` list. Returns {} when
+    none are present, and never retains a variable outside MARKER_KEYS."""
+    found = {}
+    for entry in entries:
+        name, separator, value = string(entry).partition('=')
+        if separator and name in MARKER_KEYS and len(value) <= 256:
+            found[name] = value
+    return found
+
 
 def fields(data):
     result = {}
@@ -78,6 +97,7 @@ def decode(packet):
         raise ValueError('invalid header size')
     data = fields(packet[size:])
     context = fields(one(data, 1, b''))
+    carried_env = False
     event = {
         'source': 'gvisor_seccheck', 'message_type': kind,
         'dropped_count': dropped, 'timestamp_ns': str(one(context, 1)),
@@ -91,9 +111,28 @@ def decode(packet):
     if kind == 3:
         event.update(kind='exec_succeeded', executable=string(one(data, 2, b'')),
                      argv=[string(v) for v in data.get(3, [])])
+        # Field 4 is `envv` on sentry/execve. Unlike the syscall points this is
+        # NOT opt-in -- the Sentry has always sent it, so every raw packet kept
+        # here carried the process's entire environment (keys, tokens,
+        # passwords) into the database. Same treatment as the syscall points:
+        # keep the allowlisted markers, withhold the raw bytes.
+        if 4 in data:
+            carried_env = True
+            found = markers(data[4])
+            if found:
+                event['markers'] = found
     elif kind == 11:
         event.update(kind='exec_attempt', executable=string(one(data, 6, b'')),
                      argv=[string(v) for v in data.get(7, [])])
+        # Field 8 is `envv`, requested only for the markers (see MARKER_KEYS).
+        # `carried_env` records that an environment block was present so the
+        # raw packet can be withheld below -- the markers themselves are safe
+        # to keep, the block they arrived in is not.
+        if 8 in data:
+            carried_env = True
+            found = markers(data[8])
+            if found:
+                event['markers'] = found
         if 2 in data:
             status = fields(one(data, 2))
             errno = one(status, 2)
@@ -116,7 +155,14 @@ def decode(packet):
         event['payload_base64'] = base64.b64encode(packet[size:]).decode('ascii')
     # Preserve original evidence for decoder corrections and schema upgrades.
     # This may contain sensitive argv; the DB must stay outside the workload.
-    event['raw_packet_base64'] = base64.b64encode(packet).decode('ascii')
+    # Withheld entirely when the packet carried an environment block: the
+    # decoded event keeps only the allowlisted markers, and storing the raw
+    # bytes would put every other variable -- keys, tokens, passwords -- back
+    # into the database through the side door.
+    if carried_env:
+        event['raw_withheld'] = 'envv'
+    else:
+        event['raw_packet_base64'] = base64.b64encode(packet).decode('ascii')
     return event
 
 

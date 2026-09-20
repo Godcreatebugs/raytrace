@@ -64,7 +64,13 @@ export function openStore(file) {
   const insertExperiment = db.prepare('INSERT OR REPLACE INTO experiments (id, created_at, created_ms, status, kind, span_id, model, body) VALUES (?,?,?,?,?,?,?,?)');
   const insertExplanation = db.prepare('INSERT OR REPLACE INTO explanations (key, created_at, body) VALUES (?,?,?)');
   const insertSummary = db.prepare('INSERT OR REPLACE INTO summaries (key, span_id, created_at, body) VALUES (?,?,?,?)');
-  const insertExecution = db.prepare('INSERT OR REPLACE INTO tool_executions (id, call_id, started_at, ended_at, status, divergence, resolved_args_sha, error, source, match_score, match_basis) VALUES (?,?,?,?,?,?,?,?,?,?,?)');
+  const insertCommandDescription = db.prepare('INSERT OR REPLACE INTO command_descriptions (key, command, description, model, created_at) VALUES (?,?,?,?,?)');
+  const selectCommandDescription = db.prepare('SELECT description FROM command_descriptions WHERE key = ?');
+  const insertExecution = db.prepare('INSERT OR REPLACE INTO tool_executions (id, call_id, started_at, ended_at, status, divergence, resolved_args_sha, error, source, match_score, match_basis, tier, pid, ppid, start_time_ns, argv) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+  // Descendants and orphans: same table, but `call_id` is null and the row is
+  // identified by the process itself. `id` stays the caller's stable exec id
+  // so re-ingesting the same kernel event is a no-op rather than a duplicate.
+  const insertDescendant = db.prepare('INSERT OR REPLACE INTO tool_executions (id, call_id, parent_call_id, tier, pid, ppid, start_time_ns, argv, started_at, ended_at, status, error, source) VALUES (?,NULL,?,?,?,?,?,?,?,?,?,?,?)');
   const confirmKernel = db.prepare('UPDATE tool_executions SET kernel_confirmed = 1, kernel_match_score = ?, kernel_pid = ? WHERE call_id = ?');
   const finishExecutionStmt = db.prepare('UPDATE tool_executions SET ended_at = ?, status = ?, error = ? WHERE id = ?');
   const insertProxyError = db.prepare('INSERT INTO proxy_errors (trace_id, timestamp, provider, route, error, cause) VALUES (?,?,?,?,?,?)');
@@ -194,6 +200,18 @@ export function openStore(file) {
     putExplanation(key, value) { insertExplanation.run(key, new Date().toISOString(), JSON.stringify(value)); },
 
     getSummary(key) { return fromJson(db.prepare('SELECT body FROM summaries WHERE key = ?').get(key)?.body ?? null); },
+
+    /** Model-written sentence for a sandbox command the rules could not
+     * describe (migration 006). Keyed by the command itself, so the same
+     * command is never paid for twice however many turns it appears in.
+     * Rule-derived sentences are deliberately NOT cached: they are free and
+     * deterministic, and caching them would let a rule change go unnoticed. */
+    getCommandDescription(command) {
+      return selectCommandDescription.get(sha256(String(command)))?.description ?? null;
+    },
+    putCommandDescription(command, description, model = null) {
+      insertCommandDescription.run(sha256(String(command)), String(command), String(description), model, new Date().toISOString());
+    },
     putSummary(key, spanId, value) { insertSummary.run(key, spanId, new Date().toISOString(), JSON.stringify(value)); },
     summaryForSpan(spanId) {
       const record = db.prepare('SELECT body FROM summaries WHERE span_id = ? ORDER BY created_at DESC LIMIT 1').get(spanId);
@@ -241,8 +259,26 @@ export function openStore(file) {
      * exec `id` (INSERT OR REPLACE keys on `id`, Codex's own exec UUID, which
      * is stable and unique per real run — re-ingesting the same rollout line
      * twice is a no-op, not a duplicate). */
-    recordExecution({ id, call_id, started_at, ended_at, status, divergence = null, error = null, source = 'codex_rollout', match_score = null, match_basis = null }) {
-      insertExecution.run(id, call_id, started_at ?? null, ended_at ?? null, status ?? null, divergence, null, error, source, match_score, match_basis);
+    recordExecution({ id, call_id, started_at, ended_at, status, divergence = null, error = null, source = 'codex_rollout', match_score = null, match_basis = null, tier = null, pid = null, ppid = null, start_time_ns = null, argv = null }) {
+      // Tier is recorded at capture, never recomputed downstream: an exact
+      // marker/call_id join is `mediated`, a text match that a kernel witness
+      // also saw is `corroborated`, a bare text match is `inferred`. Callers
+      // that know better pass it; this default reproduces migration 005's
+      // backfill so existing callers keep their meaning.
+      const resolved = tier ?? (match_basis === 'id' ? 'mediated' : 'inferred');
+      insertExecution.run(id, call_id, started_at ?? null, ended_at ?? null, status ?? null, divergence, null, error, source, match_score, match_basis,
+        resolved, pid ?? null, ppid ?? null, start_time_ns ?? null, argv == null ? null : JSON.stringify(argv));
+    },
+
+    /** One process that ran *underneath* a proposed call (`parent_call_id`),
+     * or underneath nothing at all (`parent_call_id` null — something ran
+     * that no tool call accounts for). Neither shape was storable before
+     * migration 005, so the gVisor forwarder discarded both; the deletion in
+     * a pretest hook is the motivating case. Never carries `call_id`: that
+     * column means "this IS the proposed call", which a descendant is not. */
+    recordDescendant({ id, parent_call_id = null, tier = 'corroborated', pid = null, ppid = null, start_time_ns = null, argv = null, started_at = null, ended_at = null, status = null, error = null, source = 'gvisor' }) {
+      insertDescendant.run(id, parent_call_id, tier, pid ?? null, ppid ?? null, start_time_ns ?? null,
+        argv == null ? null : JSON.stringify(argv), started_at ?? null, ended_at ?? null, status ?? null, error, source);
     },
 
     /** Independent, kernel-level confirmation of a row `recordExecution`
@@ -275,9 +311,41 @@ export function openStore(file) {
       const marks = spanIds.map(() => '?').join(',');
       return db.prepare(`SELECT c.call_id, c.span_id, c.output_index, c.name,
           COALESCE(e.divergence, CASE WHEN e.id IS NULL THEN 'not_executed' ELSE 'as_proposed' END) AS outcome,
-          e.status, e.error, e.source, e.match_score, e.match_basis, e.kernel_confirmed, e.kernel_match_score
+          e.status, e.error, e.source, e.match_score, e.match_basis, e.kernel_confirmed, e.kernel_match_score,
+          e.tier, e.pid,
+          (SELECT COUNT(*) FROM tool_executions d WHERE d.parent_call_id = c.call_id) AS descendant_count
         FROM tool_calls c LEFT JOIN tool_executions e ON e.call_id = c.call_id
         WHERE c.span_id IN (${marks}) ORDER BY c.span_id, c.output_index`).all(...spanIds);
+    },
+
+    /** The processes that ran underneath each proposed call in this trace --
+     * what `divergence()` structurally cannot see, since it joins on
+     * `call_id` and a descendant's is null by definition. Ordered by start so
+     * a caller can render the subtree in the order it actually happened. */
+    descendants(spanIds) {
+      if (!spanIds.length) return [];
+      const marks = spanIds.map(() => '?').join(',');
+      return db.prepare(`SELECT d.parent_call_id, d.id, d.tier, d.pid, d.ppid, d.argv, d.status, d.error,
+          d.started_at, d.ended_at
+        FROM tool_executions d
+        JOIN tool_calls c ON c.call_id = d.parent_call_id
+        WHERE c.span_id IN (${marks}) AND d.parent_call_id IS NOT NULL
+        ORDER BY d.parent_call_id, d.started_at, d.pid`).all(...spanIds)
+        .map((row) => ({ ...row, argv: fromJson(row.argv) ?? [] }));
+    },
+
+    /** Executions that matched no proposed call at all -- the shape migration
+     * 005 exists for. Scoped by time rather than span, because an
+     * unattributed row has no call and therefore no exchange to join through.
+     * `sinceMs`/`untilMs` are the session's own window; callers pass the
+     * trace's first and last exchange timestamps. */
+    unattributed({ sinceMs = 0, untilMs = Number.MAX_SAFE_INTEGER, limit = 200 } = {}) {
+      return db.prepare(`SELECT id, tier, pid, ppid, argv, status, error, started_at, ended_at
+        FROM tool_executions
+        WHERE call_id IS NULL AND parent_call_id IS NULL
+          AND CAST((julianday(started_at) - 2440587.5) * 86400000 AS INTEGER) BETWEEN ? AND ?
+        ORDER BY started_at DESC LIMIT ?`).all(sinceMs, untilMs, limit)
+        .map((row) => ({ ...row, argv: fromJson(row.argv) ?? [] }));
     },
 
     stats() {
