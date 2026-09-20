@@ -74,6 +74,13 @@ def main():
             '--mount=type=volume,src='+opts.id+'-workspace,dst=/workspace',
             '--mount=type=volume,src='+opts.id+'-home,dst=/home/node',
             '--mount=type=bind,src=/etc/raytace/resolv.conf,dst=/etc/resolv.conf,readonly',
+            # Session marker on PID 1: env is inherited across fork/exec, so
+            # every process in this sandbox carries it without the collector
+            # reconstructing a process tree. Read back by the allowlist in
+            # collector.py. Session scope only -- a per-call RAYTRACE_CALL_ID
+            # has to be stamped by whatever spawns the command, and inside
+            # this sandbox that is Codex, not RayTrace.
+            '--env', 'RAYTRACE_SESSION='+opts.id,
             '--workdir=/workspace', '--entrypoint=/bin/sleep',
             'raytace-gvisor-agent', 'infinity'], text=True).strip()
         # docker cp -a honors the deliberately normalized uid/gid in this tar.

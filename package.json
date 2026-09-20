@@ -16,6 +16,7 @@
     "sandbox:run": "node proxy/gvisor-local.mjs run",
     "sandbox:stop": "node proxy/gvisor-local.mjs stop",
     "sandbox:manager": "python3 worker/gvisor/project_manager.py serve",
+    "sandbox:approve": "python3 worker/gvisor/project_manager.py approve",
     "sandbox:import": "python3 worker/gvisor/project_manager.py import",
     "sandbox:open": "python3 worker/gvisor/project_manager.py open",
     "sandbox:list": "python3 worker/gvisor/project_manager.py list",

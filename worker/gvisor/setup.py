@@ -36,9 +36,21 @@ if __name__ == '__main__':
               'syscall/execveat/enter', 'syscall/execveat/exit']
     for number in ([221, 281] if arch == 'aarch64' else [59, 322]):
         points.append(f'syscall/sysno/{number}/exit')
+    # `envv` is an optional field on the execve points. It is requested ONLY so
+    # the collector can read the two RAYTRACE_* markers back off a process and
+    # turn correlation from a text guess into an exact join; collector.py drops
+    # every other variable (and the raw packet) before anything is written. A
+    # real environment block carries every secret a process was started with,
+    # so this must never be widened to other points or stored verbatim.
+    marker_points = {'syscall/execve/enter', 'syscall/execveat/enter'}
+    def point_config(point):
+        entry = {'name': point, 'context_fields': [f for f in context if not
+                 (point == 'sentry/exit_notify_parent' and f == 'cwd')]}
+        if point in marker_points:
+            entry['optional_fields'] = ['envv']
+        return entry
     config = {'trace_session': {'name': 'Default',
-        'points': [{'name': point, 'context_fields': [f for f in context if not
-                    (point == 'sentry/exit_notify_parent' and f == 'cwd')]} for point in points],
+        'points': [point_config(point) for point in points],
         'sinks': [{'name': 'remote', 'ignore_setup_error': False,
                    'config': {'endpoint': '/run/raytace/events.sock', 'retries': 3}}]}}
     Path('/etc/raytace/gvisor.json').write_text(json.dumps(config, indent=2))

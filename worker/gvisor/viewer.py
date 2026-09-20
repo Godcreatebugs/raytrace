@@ -15,9 +15,21 @@ def event_page(db, query):
     # when both are given.
     after = int(query.get('after', ['0'])[0])
     limit = min(500, max(1, int(query.get('limit', ['100'])[0])))
+    # `since`/`until` (epoch ms, inclusive) scope a page to one agent turn --
+    # from the prompt to the answer -- so the UI is not showing every command
+    # ever run in this sandbox. Filtered on the collector's own `received_ms`
+    # column rather than the event's timestamp_ns, which lives inside the JSON
+    # body: the two differ by well under a millisecond, and a column is
+    # indexable where a json_extract is not.
+    since = int(query.get('since', ['0'])[0])
+    until = int(query.get('until', ['0'])[0])
     clauses, params = [], []
     if container:
         clauses.append('container_id = ?'); params.append(container)
+    if since:
+        clauses.append('received_ms >= ?'); params.append(since)
+    if until:
+        clauses.append('received_ms <= ?'); params.append(until)
     if after:
         clauses.append('id > ?'); params.append(after)
     elif before:
