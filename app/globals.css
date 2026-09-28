@@ -23,7 +23,7 @@
 .descendant-tree{margin-top:6px}
 .descendant-tree>summary{font-size:11px;color:#75829a}
 .descendant-list{list-style:none;margin:6px 0 0;padding:0 0 0 10px;border-left:1px solid #26303f}
-.descendant-list .descendant{display:flex;gap:8px;align-items:baseline;padding:2px 0;flex-wrap:wrap}
+.descendant-list .descendant{display:grid;grid-template-columns:86px 52px minmax(0,1fr) auto 130px;gap:8px;align-items:baseline;padding:2px 0}
 .descendant-list .descendant code{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#b9c4d4;word-break:break-all}
 .descendant-list .descendant.failed code{color:#e39a9a}
 .descendant-meta{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;color:#5c6d87;white-space:nowrap}
@@ -85,6 +85,17 @@ li.evidence-step::before{content:'';flex:none;width:9px}
 .evidence-ai,.evidence-nodesc{margin-left:6px;font-size:9px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;padding:1px 5px;border-radius:999px;cursor:default}
 .evidence-ai{color:#c9a6e8;background:#1d1528;border:1px solid #453059}
 .evidence-nodesc{color:#8ea0ba;background:#131c29;border:1px solid #2a3951}
+/* Severity 0-3 (proxy/call-assessment.mjs). Colour carries the level, the word
+   repeats it for anyone who cannot tell the colours apart. */
+.severity-badge{margin-left:6px;font-size:9px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;padding:1px 6px;border-radius:999px;white-space:nowrap;cursor:help;border:1px solid}
+.severity-0{color:#8ea0ba;background:#131c29;border-color:#2a3951}
+.severity-1{color:#8fd3ff;background:#10213a;border-color:#2a4a72}
+.severity-2{color:#f0b54a;background:#2a1f0c;border-color:#6b4f1c}
+.severity-3{color:#ffb3bb;background:#3a1218;border-color:#8c2e3a}
+.exec-assessment{display:inline-flex;flex-wrap:wrap;align-items:center;gap:4px}
+.exec-assessment .severity-badge{margin-left:0}
+.assess-chip{font-size:10px;padding:1px 6px;border-radius:999px;background:#131c29;border:1px solid #26303f;color:#a9b6c9;white-space:nowrap;cursor:help}
+.assess-key-line{flex-basis:100%;font:10px ui-monospace,SFMono-Regular,Menlo,monospace;color:#8ea0ba;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:36ch;cursor:help}
 .evidence-exit{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;color:#5c6d87}
 .evidence-exit.failed{color:#e39a9a}
 .evidence-argv{flex-basis:100%;margin-left:0}
@@ -97,3 +108,193 @@ li.evidence-step::before{content:'';flex:none;width:9px}
 .evidence-raw{list-style:none;margin:10px 0;padding:0;max-height:420px;overflow-y:auto}
 .evidence-raw li{padding:2px 0;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
 .evidence-raw code{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#8ea0ba;word-break:break-all}
+/* Proposed vs observed (app/execution-table.tsx): what the model asked for
+   next to the process the sandbox ran. Rows stack into cards on narrow screens. */
+.exec-table-wrap{margin:8px 13px 16px;padding:12px 12px 4px;border:1px solid #26303f;border-radius:8px;background:#0d1624}
+.exec-kicker{margin-bottom:8px}
+.exec-table{width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed}
+/* Fixed columns so a long command is cut to one line instead of widening the
+   table off the screen. The two command columns share what is left. */
+.exec-table-calls th:nth-child(1){width:28px}
+.exec-table-calls th:nth-child(4){width:150px}
+.exec-table-calls th:nth-child(5){width:140px}
+.exec-table-calls th:nth-child(6){width:84px}
+.exec-table-calls th:nth-child(7){width:132px}
+.exec-table-unattributed th:nth-child(2){width:150px}
+.exec-table-unattributed th:nth-child(3){width:140px}
+.exec-table-unattributed th:nth-child(4){width:110px}
+.exec-code{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;color:#5c6d87;font-weight:400}
+.exec-cmd{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default}
+.exec-observed{display:flex;align-items:baseline;gap:6px;min-width:0}
+.exec-observed .exec-pid{flex:none}
+.descendant-list .descendant .exec-cmd{display:inline-block;max-width:100%;vertical-align:bottom}
+.descendant-time,.descendant-span{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;color:#5c6d87;white-space:nowrap}
+.descendant-what{display:flex;align-items:baseline;min-width:0;overflow:hidden}
+.descendant-branch{color:#3d4a5e;flex:none;font-size:10px}
+.descendant-outcome{font-size:11px;white-space:nowrap}
+@media(max-width:640px){.descendant-list .descendant{grid-template-columns:auto auto 1fr;row-gap:2px}.descendant-what{grid-column:1/-1;order:3}.descendant-meta{order:4}.descendant-outcome{order:5}}
+.exec-table th{text-align:left;font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#5c6d87;padding:4px 8px 6px;border-bottom:1px solid #20334a;white-space:nowrap}
+.exec-table td{padding:7px 8px;border-bottom:1px solid #172233;vertical-align:baseline;color:#c7d2e2}
+.exec-table code{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#b9c4d4;word-break:break-all}
+.exec-row{cursor:pointer}
+.exec-row:hover td{background:#121c2c}
+.exec-num{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#5c6d87}
+.exec-time{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}
+.exec-pid{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#93bce9;padding:0;background:none;border:0;text-decoration:underline dotted}
+.exec-table .exec-muted,.exec-muted{color:#5c6d87}
+.exec-table .exec-ok,.exec-ok{color:#66d6a8;white-space:nowrap}
+.exec-table .exec-fail,.exec-fail{color:#ff9aa6;white-space:nowrap}
+.exec-link{white-space:nowrap;cursor:help}
+.exec-table .exec-link-strong,.exec-link-strong{color:#8fd3ff}
+.exec-table .exec-link-weak,.exec-link-weak{color:#e3c368}
+.exec-table .exec-link-none,.exec-link-none{color:#5c6d87}
+.exec-table .exec-said-ok,.exec-said-ok{color:#66d6a8;white-space:nowrap;cursor:help}
+.exec-table .exec-said-warn,.exec-said-warn{color:#f0b54a;font-weight:600;white-space:nowrap;cursor:help}
+.exec-table .exec-said-muted,.exec-said-muted{color:#5c6d87;cursor:help}
+.exec-children td{padding-top:0}
+.exec-summary{margin-top:2px}
+.exec-summary .link-button{font:inherit}
+/* The sandbox tree's link back to a call. */
+.evidence-call{margin-left:6px;font-size:10px;padding:1px 6px;border-radius:999px;white-space:nowrap;background:#10213a;border:1px solid #2a4a72;color:#93bce9}
+.evidence-call.under{background:transparent;border-color:#26303f;color:#75829a}
+.evidence-call.unattributed{background:#131c29;border-color:#2a3951;color:#8ea0ba;cursor:help}
+/* A jump target: marked briefly, then left with a quiet outline. */
+@keyframes exec-pulse{from{background:#1d3a5c}to{background:transparent}}
+.exec-highlight{animation:exec-pulse 2.4s ease-out;outline:1px solid #2f5d8a;border-radius:4px}
+@media (prefers-reduced-motion:reduce){.exec-highlight{animation:none;background:#16283f}}
+@media(max-width:640px){
+  .exec-table-wrap{margin:8px 0 16px}
+  .exec-table thead{display:none}
+  .exec-table,.exec-table tbody,.exec-table tr,.exec-table td{display:block;width:100%}
+  .exec-table tr.exec-row{padding:8px 0;border-bottom:1px solid #20334a}
+  .exec-table td{border:0;padding:2px 4px}
+  .exec-table td[data-label]::before{content:attr(data-label);display:inline-block;min-width:84px;margin-right:8px;font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#5c6d87}
+  .exec-table td.exec-num{font-weight:700;color:#8ea0ba}
+  .exec-table td.exec-num::before{content:'Call #';min-width:0;margin-right:0}
+  .exec-time,.exec-ok,.exec-fail,.exec-link,.exec-said-ok,.exec-said-warn{white-space:normal}
+}
+
+/* ---- Four-section layout (app/page.tsx): Prompts, Tool calls, Sandbox, Lab.
+   One sidebar, one content column; each section is a single list or table. */
+.rt-shell{min-height:100vh;display:grid;grid-template-columns:230px minmax(0,1fr);background:radial-gradient(ellipse at 56% 0%,#14223a 0%,#09111e 48%)}
+.rt-nav{position:sticky;top:0;height:100vh}
+.rt-nav .nav-destinations{margin-top:28px;display:grid;gap:2px}
+.rt-nav .nav-item{width:100%;border:0;background:none;text-align:left}
+.rt-nav .nav-item:hover{background:#131f31}
+.rt-viewing{margin-top:28px;padding:0 9px;display:grid;gap:5px}
+.rt-viewing .workspace-label{margin:0}
+.rt-viewing button{border:1px solid #243650;background:#101b2d;border-radius:7px;padding:8px 9px;text-align:left;font-size:12px;line-height:1.4;color:#d6e0f0;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.rt-viewing small{font-size:11px;color:#75829a}
+.rt-nav .status{padding:0}
+.rt-nav .status.offline{color:#e39a9a}.rt-nav .status.offline i{background:#e39a9a}
+.rt-view{min-width:0;padding:28px 34px 48px;max-width:1180px}
+.rt-view-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+.rt-view-head h1{margin:6px 0 0;font-size:20px;letter-spacing:-.02em}
+.rt-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.rt-button{display:inline-flex;align-items:center;gap:6px;border:1px solid #2e4968;background:#142238;color:#c7d4e8;font-size:12px;font-weight:600;padding:7px 12px;border-radius:7px}
+.rt-button:hover{background:#1a2c47;border-color:#48d2d2}
+.rt-muted{color:#75829a}
+.rt-empty{color:#8290a8;font-size:13px;padding:24px 0}
+.rt-foot{color:#75829a;font-size:11px;margin-top:12px}
+.rt-focus{background:#12303a !important;box-shadow:inset 3px 0 0 #48d2d2}
+
+/* Activity graph */
+.rt-activity{border:1px solid #20334a;border-radius:10px;background:#0d1624;padding:14px 16px}
+.rt-activity-head{display:flex;gap:8px;align-items:baseline;margin-bottom:10px;font-size:13px}
+.rt-activity-head span{color:#8290a8;font-size:12px}
+.rt-activity-scroll{overflow-x:auto;padding-bottom:4px}
+.rt-activity-grid{display:grid;gap:3px;width:max-content}
+.rt-activity-month,.rt-activity-day{font-size:9px;color:#75829a;line-height:12px;white-space:nowrap;overflow:visible}
+.rt-cell{width:12px;height:12px;border-radius:2px;border:0;padding:0;display:inline-block;background:#162235}
+.rt-cell:disabled{cursor:default}
+.rt-cell-1{background:#124a4a}.rt-cell-2{background:#1b7070}.rt-cell-3{background:#2aa3a3}.rt-cell-4{background:#48d2d2}
+button.rt-cell:not(:disabled):hover,.rt-cell:focus-visible{outline:1px solid #e8eef8;outline-offset:1px}
+.rt-cell-on{outline:2px solid #e8eef8;outline-offset:1px}
+.rt-activity-legend{display:flex;gap:3px;align-items:center;justify-content:flex-end;font-size:10px;color:#75829a;margin-top:8px}
+.rt-activity-legend .rt-cell{margin:0 1px}
+
+/* Prompt list */
+.rt-list-head{display:flex;justify-content:space-between;align-items:center;margin:22px 0 8px;font-size:11px;color:#75829a;letter-spacing:.08em;font-weight:700}
+.rt-list-head small{font-weight:400;letter-spacing:0}
+.rt-chip{display:inline-flex;gap:6px;align-items:center;border:1px solid #2e4968;background:#142238;color:#e8eef8;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;letter-spacing:0}
+.rt-prompts{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.rt-prompt{border:1px solid #1f2d42;border-radius:9px;background:#0d1624}
+.rt-prompt.open{border-color:#2e4968;background:#101c2e}
+.rt-prompt-row{width:100%;border:0;background:none;text-align:left;display:grid;grid-template-columns:130px minmax(0,1fr) auto;gap:14px;align-items:baseline;padding:12px 14px}
+.rt-prompt-row time{margin:0;color:#75829a;font-size:12px}
+.rt-prompt-row strong{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rt-prompt-row small{font-size:11px;color:#75829a;white-space:nowrap}
+.rt-prompt-detail{padding:0 14px 14px;border-top:1px solid #1f2d42}
+.rt-prompt-detail h3{font-size:10px;letter-spacing:.12em;color:#75829a;margin:14px 0 6px}
+.rt-text{white-space:pre-wrap;margin:0;font-size:13px;line-height:1.55;color:#d6e0f0;max-height:340px;overflow:auto;padding:10px 12px;background:#0a1220;border:1px solid #1d2b40;border-radius:7px}
+.rt-prompt-detail .rt-actions{margin-top:14px}
+
+/* Stats strip */
+.rt-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:1px;margin:0 0 18px;border:1px solid #20334a;border-radius:9px;overflow:hidden;background:#20334a}
+.rt-stats>div{background:#0d1624;padding:11px 14px;display:grid;gap:4px}
+.rt-stats dt{font-size:10px;letter-spacing:.1em;color:#75829a;text-transform:uppercase}
+.rt-stats dd{margin:0;font-size:15px;font-weight:600;color:#e8eef8;overflow-wrap:anywhere}
+.rt-sev-counts{display:flex;gap:4px;flex-wrap:wrap}.rt-sev-counts .severity-badge{margin:0;cursor:pointer;transition:opacity .12s}
+.rt-sev-counts .severity-badge:hover{filter:brightness(1.25)}
+.rt-sev-counts .rt-sev-on{box-shadow:0 0 0 2px currentColor}
+.rt-sev-counts .rt-sev-off{opacity:.4}
+.rt-filter-note{margin:0 0 10px}
+
+/* Tables */
+.rt-table-wrap{border:1px solid #20334a;border-radius:9px;overflow-x:auto;background:#0d1624}
+.rt-table{width:100%;border-collapse:collapse;font-size:12px}
+.rt-table th{text-align:left;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#75829a;font-weight:700;padding:9px 10px;border-bottom:1px solid #20334a;white-space:nowrap}
+.rt-table td{padding:8px 10px;border-bottom:1px solid #172334;vertical-align:baseline}
+.rt-table tr:last-child td{border-bottom:0}
+.rt-row{cursor:pointer}.rt-row:hover{background:#111d2f}
+.rt-row.failed .rt-cmd{color:#e39a9a}
+.rt-child td{background:#0b1320;font-size:11px}
+.rt-caret{color:#5c6d87;vertical-align:-1px;margin-right:4px;transition:transform .12s}
+.rt-row.open .rt-caret,.rt-caret.down{transform:rotate(90deg)}
+.rt-caret-gap{display:inline-block;width:16px}
+.rt-num{white-space:nowrap;color:#8290a8;width:44px}
+.rt-tool{white-space:nowrap;color:#a9b6c9}
+.rt-cmd{max-width:0;width:55%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rt-cmd .exec-cmd{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#c7d4e8}
+.rt-time,.rt-pid{white-space:nowrap;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#8ea0ba}
+.rt-reported{white-space:nowrap;font-size:11px}.rt-reported.ok{color:#66d6a8}.rt-reported.failed,.rt-reported.rejected{color:#e39a9a}.rt-reported.none{color:#5c6d87}
+.rt-ran{white-space:nowrap;font-size:11px;font-weight:600;border:0;background:none;padding:0}
+.rt-ran.ok{color:#66d6a8;text-decoration:underline}.rt-ran.fail{color:#e39a9a}.rt-ran.none{color:#5c6d87}
+.rt-trip td{background:#0a1220;padding:7px 10px;font-size:11px;color:#8290a8}
+.rt-trip td{display:table-cell}
+.rt-trip span{font-weight:700;letter-spacing:.06em;text-transform:uppercase;font-size:10px;color:#9fb0c8;margin-right:10px}
+.rt-trip em{font-style:normal;color:#c7d4e8;margin-right:10px}
+.rt-trip small{float:right;color:#75829a}
+.rt-expand td{background:#0b1422;padding:4px 14px 14px 44px}
+.rt-expand h4{font-size:10px;letter-spacing:.1em;color:#75829a;margin:10px 0 5px;text-transform:uppercase}
+.rt-expand pre{margin:0;max-height:260px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:9px 11px;background:#08101c;border:1px solid #1d2b40;border-radius:6px;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#b9c4d4}
+.rt-expand .rt-actions{margin-top:12px}
+
+/* Severity chip and its distribution popover */
+.rt-sev{margin-left:0;cursor:pointer}
+.rt-sev-pop{background:#101a2a !important;color:#e8eef8 !important;border:1px solid #2e4968;font-size:12px;width:250px}
+.rt-sev-pop p{margin:0;color:#a9b6c9;font-size:11px;line-height:1.45}
+.rt-dist{list-style:none;margin:2px 0;padding:0;display:grid;gap:4px}
+.rt-dist li{display:grid;grid-template-columns:48px 1fr 34px;gap:6px;align-items:center;font-size:11px;color:#a9b6c9}
+.rt-dist i{height:8px;background:#162235;border-radius:4px;overflow:hidden;display:block}
+.rt-dist b{display:block;height:100%;border:0;border-radius:4px}
+.rt-dist em{font-style:normal;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;text-align:right}
+
+/* Lab: DecisionLab keeps its own styles; here it sits in the content column. */
+.rt-lab .trace-picker{max-width:720px;margin:6px 0 18px}
+.rt-lab-body .lab{display:block;padding:0;border:0;background:none}
+
+@media(max-width:760px){
+  .rt-shell{display:block}
+  .rt-nav{position:static;height:auto;flex-direction:column;padding:14px 16px}
+  .rt-nav .nav-destinations{grid-template-columns:repeat(2,1fr);margin-top:12px}
+  .rt-viewing{margin-top:12px}
+  .rt-view{padding:20px 16px 40px}
+  .rt-prompt-row{grid-template-columns:1fr}
+}
+/* The old shell's narrow-screen rules hide or icon-only the .nav; the new
+   sidebar stays readable at every width. */
+.rt-shell .rt-nav{display:flex}
+.rt-shell .rt-nav .brand{font-size:20px;padding:0 9px}
+.rt-shell .rt-nav .nav-item{font-size:13px;justify-content:flex-start}
+.rt-shell .rt-nav .nav-bottom{font-size:11px;justify-content:flex-start}

@@ -61,7 +61,7 @@ const nodeTypes = { request: RequestNode };
 export function TraceGraph({ trace, blocks, summaries, onSelectStep }: { trace: Trace; blocks: TraceBlock[]; summaries: Record<string, SummaryState>; onSelectStep: (index: number) => void }) {
   const { nodes, edges } = useMemo(() => {
     const requestMetricById = new Map((trace.requests || []).map((request) => [request.id, request]));
-    const callsByExchangeId = new Map<string, { verified: boolean; name: string; status: string | null; match_score: number | null; match_basis: 'id' | 'text' | null }[]>();
+    const callsByExchangeId = new Map<string, { verified: boolean; name: string; status: string | null; match_score: number | null; match_basis: 'id' | 'text' | 'window' | null }[]>();
     for (const call of trace.callVerifications || []) {
       const list = callsByExchangeId.get(call.exchange_id) || [];
       list.push({ verified: call.verified, name: call.name, status: call.status, match_score: call.match_score, match_basis: call.match_basis });
