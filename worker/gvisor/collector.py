@@ -189,6 +189,7 @@ def serve(endpoint, database):
     def client(conn):
         db = init_db(database)
         connection = str(uuid.uuid4())
+        container = ''
         def record(event):
             db.execute('INSERT INTO runtime_events(connection,received_ms,container_id,kind,body) VALUES(?,?,?,?,?)',
                        (connection, int(time.time() * 1000), event.get('container_id', ''),
@@ -210,17 +211,22 @@ def serve(endpoint, database):
                 if flags & socket.MSG_TRUNC:
                     raise ValueError('oversized event')
                 event = decode(packet)
+                if event['container_id']:
+                    container = event['container_id']
                 if event['dropped_count'] != previous_dropped:
                     record({'kind': 'collection_gap', 'container_id': event['container_id'],
                             'dropped_delta': (event['dropped_count'] - previous_dropped) % (1 << 32)})
                     previous_dropped = event['dropped_count']
                 record(event)
         except Exception as error:
-            record({'kind': 'collection_error', 'error': str(error)[:500]})
+            record({'kind': 'collection_error', 'container_id': container, 'error': str(error)[:500]})
         finally:
             # EOF alone does not prove a complete trace; final dropped events
-            # may never have been reported in a subsequent packet.
-            record({'kind': 'collector_disconnected', 'coverage': 'not_certified'})
+            # may never have been reported in a subsequent packet. Tagged with
+            # the sandbox this connection carried (one per sandbox), so a
+            # consumer can tell whose open processes will now never report an
+            # exit; empty if no event ever arrived.
+            record({'kind': 'collector_disconnected', 'container_id': container, 'coverage': 'not_certified'})
             conn.close()
             db.close()
             slots.release()

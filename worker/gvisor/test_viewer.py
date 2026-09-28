@@ -54,3 +54,14 @@ class PaginationTests(unittest.TestCase):
         both=event_page(db,{'container':['target'],'after':['4'],'before':['2']})
         self.assertEqual([e['event_id'] for e in both['events']],[5,6])
         db.close()
+
+    def test_process_feed_includes_failed_execs_and_disconnects(self):
+        # The forwarder needs exec_failed (a program that never started) and
+        # collector_disconnected (no more exits will come) to close rows.
+        db=sqlite3.connect(':memory:')
+        db.execute('CREATE TABLE runtime_events(id INTEGER PRIMARY KEY,container_id TEXT,kind TEXT,body TEXT)')
+        for i,kind in enumerate(['exec_succeeded','syscall_enter','exec_failed','process_exit','collector_disconnected']):
+            db.execute('INSERT INTO runtime_events VALUES(?,?,?,?)',(i+1,'target',kind,json.dumps({'kind':kind})))
+        page=event_page(db,{'container':['target'],'processes':['1']})
+        self.assertEqual(sorted(e['kind'] for e in page['events']),['collector_disconnected','exec_failed','exec_succeeded','process_exit'])
+        db.close()

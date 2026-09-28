@@ -31,7 +31,7 @@ test('smoke: capture → inspect → experiment', { timeout: 20000 }, async (t) 
     env: {
       ...process.env,
       RAYTACE_PORT: '0',
-      RAYTACE_DB: join(directory, 'raytace.db'),
+      RAYTACE_DB: join(directory, 'evidence.db'),
       RAYTACE_PROVIDER: 'openrouter',
       OPENROUTER_API_KEY: 'smoke-secret',
       RAYTACE_OPENROUTER_MODEL: 'coder',

@@ -5,19 +5,21 @@ import { createServer } from 'node:http';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
 import { join, dirname } from 'node:path';
-import { evidenceFor, replayEligibility, createExperiment, runExperiment, outcome } from './experiment-engine.mjs';
+import { evidenceFor, replayEligibility, createExperiment, runExperiment, outcome, proposedCommand } from './experiment-engine.mjs';
 import { loadEnvFile } from 'node:process';
 import { providerConfig, routeRequest, selectModel } from './providers.mjs';
-import { groupPromptExchanges, latestSessionRows } from './prompt-traces.mjs';
+import { latestSessionRows } from './prompt-traces.mjs';
 import { inspectStep, createStepRun, runDecision } from './step-lab.mjs';
 import { executeSequence } from './execution-runner.mjs';
 import { explanationRequest, parseExplanations } from './explanations.mjs';
 import { summaryRequest, parseSummary } from './summaries.mjs';
 import { fold as foldEvents, describeAll, undescribed, describeRequest, parseDescriptions } from './exec-narrative.mjs';
-import { matchBatch } from './execution-correlation.mjs';
+import { matchBatch, OPEN_WINDOW_CAP_MS } from './execution-correlation.mjs';
 import { startGvisorForwarder } from './gvisor-forwarder.mjs';
 import { omitToolChunkIds, toolResultStatus } from './tool-metadata.mjs';
-import { openStore } from './store.mjs';
+import { openEvidenceStore } from './evidence-store.mjs';
+import { typesafeConfig, systemOne } from './typesafe.mjs';
+import { groupByCall, assessmentRequests, combineGroup, rulesOnly, withProbabilities } from './call-assessment.mjs';
 
 try { loadEnvFile(); } catch (error) { if (error.code !== 'ENOENT') throw error; }
 const routing = providerConfig();
@@ -34,9 +36,9 @@ const maxBodyBytes = Number(process.env.RAYTACE_MAX_BODY_BYTES || 2_000_000);
 const liveExchanges = new Map(); // Credentials stay in process memory, never in the event log.
 const jobs = new Map();
 const jobControllers = new Map();
-const dbFile = process.env.RAYTACE_DB || join(dirname(store), 'raytace.db');
+const dbFile = process.env.RAYTACE_DB || join(dirname(store), 'evidence.db');
 const archiveJsonl = process.env.RAYTACE_ARCHIVE_JSONL === '1';
-const db = openStore(dbFile);
+const db = openEvidenceStore(dbFile);
 const allowedOrigins = new Set((process.env.RAYTACE_UI_ORIGINS || '').split(',').filter(Boolean));
 function trustedOrigin(origin) {
   if (!origin) return true;
@@ -51,6 +53,57 @@ function redact(value) {
     /authorization|api[-_]?key|token|secret|password/i.test(key) ? [key, '[REDACTED]'] : [key, redact(item)],
   ));
 }
+// Command severity (Jev). Without TYPESAFE_API_KEY, or when a request fails,
+// only the rule floor is shown -- and only where a rule actually fired.
+const typesafe = typesafeConfig();
+const pendingAssessments = new Map();
+const ASSESS_CONCURRENCY = 4;
+
+async function mapLimit(items, limit, run) {
+  const results = Array.from({ length: items.length });
+  let next = 0;
+  const worker = async () => { while (next < items.length) { const index = next++; results[index] = await run(items[index]); } };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+async function assessGroup(group, context) {
+  if (!typesafe.enabled) return rulesOnly(group);
+  const { key, requests } = assessmentRequests(group, context, typesafe.model);
+  const cached = db.getCallAssessment(key);
+  if (cached) return withProbabilities(cached);
+  if (!pendingAssessments.has(key)) {
+    const task = (async () => {
+      const responses = await Promise.all(requests.map((request) => systemOne(typesafe, { state: request.state, questions: request.questions })));
+      const model = responses[0]?.model ?? typesafe.model;
+      const input_tokens = responses.reduce((sum, response) => sum + (response.usage?.input_tokens ?? 0), 0);
+      const result = { ...combineGroup(group, requests, responses), model, input_tokens };
+      db.putCallAssessment(key, group.call_id, model, { ...result, answers: responses.map((response) => response.answers) });
+      return result;
+    })().finally(() => pendingAssessments.delete(key));
+    pendingAssessments.set(key, task);
+  }
+  try { return await pendingAssessments.get(key); } catch (error) {
+    console.error('[raytace] Jev assessment unavailable:', error.message);
+    return rulesOnly(group);
+  }
+}
+
+/** Sets `severity` on each top-level command and returns call-level labels
+ * keyed by call id. Never throws: severity must not cost us the evidence. */
+async function assessCommands(commands) {
+  const groups = groupByCall(commands);
+  const contexts = db.toolCallContexts(groups.map((group) => group.call_id));
+  const results = await mapLimit(groups, ASSESS_CONCURRENCY, (group) => assessGroup(group, contexts.get(group.call_id) ?? null));
+  const labels = {};
+  groups.forEach((group, index) => {
+    const { severities, labels: callLabels } = results[index];
+    group.trees.forEach((tree, position) => { tree.root.severity = severities[position] ?? null; });
+    if (callLabels && group.call_id) labels[group.call_id] = callLabels;
+  });
+  return labels;
+}
+
 async function record(event) {
   const row = omitToolChunkIds(event);
   if (row.event_type === 'model.exchange' && row.span_id) db.recordExchange(row);
@@ -136,9 +189,26 @@ function splitExchange(row) {
   steps.push(event('model', `Exchange complete · ${row.response?.status || 'unknown'}`, `${row.request?.bytes || 0} B sent · ${row.response?.bytes || 0} B received`, completed, { response_status: response.status ?? null, http_status: row.response?.status ?? null, request_bytes: row.request?.bytes || 0, response_bytes: row.response?.bytes || 0, response_reasoning: response.reasoning ?? null }));
   return steps;
 }
+/** The fields that identify and time the sandbox process a call ran as
+ * (db.divergence). All null when nothing was observed for the call. */
+function executionFields(real) {
+  return {
+    exec_id: real?.exec_id ?? null,
+    pid: real?.pid ?? null,
+    start_time_ns: real?.start_time_ns ?? null,
+    argv: Array.isArray(real?.argv) ? real.argv : null,
+    started_at: real?.started_at ?? null,
+    ended_at: real?.ended_at ?? null,
+    exit_code: real?.exit_code ?? null,
+    window_start_ms: real?.window_start_ms ?? null,
+    window_end_ms: real?.window_end_ms ?? null,
+  };
+}
 async function readTraces(includeHistory = false) {
   const rows = db.exchangeRows({ history: includeHistory }).map(omitToolChunkIds);
-  const groupedRows = groupPromptExchanges(rows);
+  // Rows arrive already grouped: each carries its turn as trace_id and the
+  // turn's prompt as promptTitle, decided once at capture (evidence-store.mjs).
+  const groupedRows = rows;
   // The store already scopes the live view to the newest session; keep the
   // filter so captures made before session tracking behave as they always did.
   const exchangeRows = includeHistory ? groupedRows : (latestSessionRows(groupedRows).length ? latestSessionRows(groupedRows) : groupedRows);
@@ -151,7 +221,8 @@ async function readTraces(includeHistory = false) {
     if (!Array.isArray(output)) continue;
     for (const [outputIndex, item] of output.entries()) {
       if (item?.call_id && /function_call|tool_use|tool_call/i.test(item?.type || '') && !origins.has(item.call_id)) {
-        origins.set(item.call_id, { call_id: item.call_id, trace_id: row.trace_id, exchange_id: row.span_id, output_index: outputIndex, name: item.name });
+        origins.set(item.call_id, { call_id: item.call_id, trace_id: row.trace_id, exchange_id: row.span_id, output_index: outputIndex, name: item.name,
+          proposed: proposedCommand(item.arguments ?? item.input ?? item.function?.arguments ?? '') });
       }
     }
   }
@@ -163,6 +234,10 @@ async function readTraces(includeHistory = false) {
     if (/^rtp-[a-f0-9]{32}$/.test(row.session_id || '')) trace.sandboxId = row.session_id;
     shownResultsByTrace.set(row.trace_id, shownResults);
     trace.requests.push({ id: row.span_id, model: row.request?.payload?.model || 'unknown', startedAt: row.timestamp, completedAt: row.completed_at || null, ...(row.metrics || requestMetrics(row)) });
+    // Rows are oldest-first, so the last request that produced text is the
+    // turn's final answer, and the last completion is when the turn ended.
+    trace.endedAt = row.completed_at || row.timestamp;
+    try { const text = outcome(row.response?.payload || {}).text; if (text) trace.answer = text; } catch { /* incomplete capture */ }
     trace.events.push(...splitExchange(row).map((step) => {
       if (!step.title.startsWith('Tool result:')) return step;
       const raw = JSON.parse(step.raw); const origin = origins.get(raw.call_id);
@@ -192,24 +267,23 @@ async function readTraces(includeHistory = false) {
     }
     grouped.set(row.trace_id, trace);
   }
-  // Overlay real execution ground truth (proxy/execution-correlation.mjs +
-  // tool_executions) onto each tool-result evidence item, keyed by call_id —
+  // Overlay observed sandbox execution (runtime_processes + attributions,
+  // via db.divergence) onto each tool-result evidence item, keyed by call_id —
   // the one field both sides share. Falls back to evidenceFor's regex
   // heuristic (succeeded, based on scanning the result text) wherever no
-  // real execution row was correlated yet, so older captures and sessions
-  // that never ran the execution tailer keep behaving as before.
+  // process was tied to the call, e.g. a session run outside the sandbox.
   for (const trace of grouped.values()) {
     const spanIds = trace.requests.map((request) => request.id);
     const divergenceRows = db.divergence(spanIds).filter((row) => row.call_id);
     const byCallId = new Map(divergenceRows.map((row) => [row.call_id, row]));
     // Processes that ran underneath each call. divergence() joins on call_id
     // and a descendant's is null by definition, so these need their own query
-    // (see proxy/migrations/005_execution_provenance.sql).
+    // (inherited attributions; see db.descendants in evidence-store.mjs).
     const descendantsByCall = new Map();
     for (const row of db.descendants(spanIds)) {
       if (!descendantsByCall.has(row.parent_call_id)) descendantsByCall.set(row.parent_call_id, []);
       descendantsByCall.get(row.parent_call_id).push({
-        id: row.id, tier: row.tier, pid: row.pid, ppid: row.ppid, argv: row.argv,
+        id: row.id, tier: row.tier, pid: row.pid, ppid: row.ppid, start_time_ns: row.start_time_ns ?? null, argv: row.argv,
         status: row.status ?? null, error: row.error ?? null,
         started_at: row.started_at ?? null, ended_at: row.ended_at ?? null,
       });
@@ -231,8 +305,8 @@ async function readTraces(includeHistory = false) {
         real_error: real.error ?? null,
         match_score: real.match_score ?? null,
         match_basis: real.match_basis ?? null,
-        // Which witness produced the row ('codex_rollout' | 'gvisor'), and
-        // whether the kernel-level layer saw it start. Both drive the badge.
+        // Which witness observed it (only 'gvisor' now), and whether the
+        // runtime layer saw it start. Both drive the badge.
         source: real.source ?? null,
         kernel_confirmed: real.kernel_confirmed === 1,
         // How this call's execution was attributed, recorded at capture (see
@@ -241,14 +315,21 @@ async function readTraces(includeHistory = false) {
         // text-similarity guess ended up wearing the same badge as an exact
         // join. Null for rows written before 005.
         tier: real.tier ?? null,
+        // The call's own process, so the decision chain can say which pid
+        // this call ran as and jump to it in the sandbox tree.
+        ...executionFields(real),
         descendants: descendantsByCall.get(item.call_id) ?? [],
         descendant_count: real.descendant_count ?? 0,
         verified,
+        // Whether the agent's own report of the result (exit code, wall
+        // time) agrees with what the runtime observed. See migration 007.
+        reported_check: real.reported_check ?? null,
         // Real ground truth overrides the text-scanning heuristic once we
         // have it -- except while a sandbox command is still 'running'
-        // (gVisor has seen it start but not exit yet): asserting success or
-        // failure there would be a fact we don't have, so keep the heuristic.
-        succeeded: verified && real.status !== 'running' ? real.status === 'completed' : item.succeeded,
+        // (gVisor has seen it start but not exit yet) or its outcome is
+        // 'unknown' (the evidence that would say was lost): asserting success
+        // or failure there would be a fact we don't have, so keep the heuristic.
+        succeeded: verified && real.status !== 'running' && real.status !== 'unknown' ? real.status === 'completed' : item.succeeded,
       };
     });
 
@@ -273,7 +354,14 @@ async function readTraces(includeHistory = false) {
         source: real?.source ?? null,
         kernel_confirmed: real?.kernel_confirmed === 1,
         tier: real?.tier ?? null,
+        reported_check: real?.reported_check ?? null,
         descendant_count: real?.descendant_count ?? 0,
+        // Everything the "proposed vs observed" table needs for this row:
+        // what the model asked for, and the process that actually ran.
+        output_index: origin.output_index,
+        proposed: origin.proposed ?? null,
+        ...executionFields(real),
+        descendants: descendantsByCall.get(origin.call_id) ?? [],
       };
     });
   }
@@ -292,54 +380,43 @@ const pendingSummaries = new Map();
 const MAX_CONCURRENT_SUMMARIES = 4; // cheap+budget-capped calls; safe to run several at once instead of one at a time
 
 /**
- * Resolves real, observed executions to the proposed tool calls they
- * fulfilled and records them. Shared by two witnesses that must never
- * disagree on matching rules:
- *   - POST /raytace/executions -- codex.mjs's rollout-log tailer
- *     (source 'codex_rollout'; each event carries Codex's own status,
- *     exit code and duration, so the row is complete on arrival).
- *   - the gVisor forwarder (proxy/gvisor-forwarder.mjs) for sandbox
- *     sessions (source 'gvisor', kernel = true): the row is written at
- *     exec time with status 'running' and `kernel_confirmed = 1`, and
- *     db.finishExecution closes it out when the process_exit arrives.
- * `sessionId` scopes candidates to one recorded session; the rollout
- * tailer leaves it null. Returns exec id -> match for whatever matched;
- * anything else stays `not_executed`, never a guess. See
+ * Records sandbox processes the gVisor forwarder observed and ties each to
+ * the proposed tool call it ran for, when one can be identified. Every
+ * process is recorded whether or not it matches: a process with no
+ * attribution is what "ran, but no tool call accounts for it" means.
+ *
+ * Candidates are the session's proposed calls not yet tied to a process,
+ * each with its causal window (proposal -> result sent back). A process
+ * carrying RAYTRACE_CALL_ID needs no matching: the call id travelled with
+ * it, so that join is exact and overrides the text match. It is still
+ * checked against this session's own candidates, so a forged or stale
+ * marker cannot attach a process to a call in another session.
+ * Returns exec id -> match for whatever matched; see
  * execution-correlation.mjs for why this is not a plain id lookup.
  */
-function ingestExecutions(events, { sessionId = null, source = 'codex_rollout', kernel = false } = {}) {
+function ingestExecutions(events, { sessionId = null } = {}) {
   const matches = new Map();
   if (!Array.isArray(events) || !events.length) return matches;
+  const recorded = new Map(events.map((event) => [event.id, db.recordProcessStart({
+    containerId: event.container_id, projectId: sessionId, raw: event.raw, startedMs: event.timestamp })]));
   const timestamps = events.map((e) => e.timestamp).filter(Number.isFinite);
-  if (!timestamps.length) return matches;
-  const WINDOW_MS = 30_000;
-  const candidates = db.candidatesInWindow(Math.min(...timestamps) - WINDOW_MS, Math.max(...timestamps) + WINDOW_MS, { sessionId });
-  const found = matchBatch(events, candidates, { windowMs: WINDOW_MS });
-  // A process carrying RAYTRACE_CALL_ID needs no matching: the call id
-  // travelled with it from whatever spawned it, so the join is a fact rather
-  // than a similarity score. Overrides the text match rather than competing
-  // with it -- if they ever disagree, the marker is the one that was there.
-  // Still checked against this session's own candidate pool, so a forged or
-  // stale marker can't attach an exec to a call in another session.
-  const known = new Set(candidates.map((c) => c.call_id));
+  if (!sessionId || !timestamps.length) return matches;
+  // The pool reaches back as far as an open window may stay open, plus the
+  // clock margin between the proxy and the sandbox.
+  const margin = Math.max(0, ...events.map((e) => e.margin).filter(Number.isFinite));
+  const candidates = db.candidatesInWindow(Math.min(...timestamps) - OPEN_WINDOW_CAP_MS - margin, Math.max(...timestamps) + margin, { sessionId });
+  const found = matchBatch(events, candidates);
+  const byExternalId = new Map(candidates.map((c) => [c.external_call_id, c.call_id]));
   for (const event of events) {
-    const marked = event.call_marker && known.has(event.call_marker)
-      ? { call_id: event.call_marker, score: 1, basis: 'id' }
-      : null;
-    const match = marked ?? found.get(event.id);
-    if (!match) continue; // no confident match -- leaves this row as today's not_executed default, never worse
-    const at = Number.isFinite(event.timestamp) ? new Date(event.timestamp).toISOString() : null;
-    let startedAt = at;
-    let endedAt = at;
-    if (source === 'gvisor') endedAt = null; // exec observed; the outcome arrives separately as process_exit
-    else if (Number.isFinite(event.timestamp) && Number.isFinite(event.durationMs)) startedAt = new Date(event.timestamp - event.durationMs).toISOString();
-    db.recordExecution({ id: event.id, call_id: match.call_id, started_at: startedAt, ended_at: endedAt, status: event.status ?? (source === 'gvisor' ? 'running' : null), error: event.error ?? null, source, match_score: match.score, match_basis: match.basis,
-      // A marker join is `mediated`; a text match a kernel witness also saw is
-      // `corroborated`; a bare text match stays `inferred`. Recorded here, at
-      // capture, so nothing downstream can promote its own confidence later.
-      tier: marked ? 'mediated' : (kernel ? 'corroborated' : null),
-      pid: event.pid ?? null, ppid: event.ppid ?? null, start_time_ns: event.start_time_ns ?? null, argv: event.argv ?? null });
-    if (kernel) db.confirmKernelExecution({ call_id: match.call_id, match_score: match.score, pid: event.pid ?? null });
+    const eventId = recorded.get(event.id)?.eventId;
+    const markedCall = event.call_marker ? byExternalId.get(event.call_marker) : null;
+    const match = markedCall ? { call_id: markedCall, score: 1, basis: 'marker' } : found.get(event.id);
+    if (!match || !eventId) continue; // no confident match: the process stays recorded, unattributed -- never a guess
+    db.attribute({ toolCallId: match.call_id, eventId, method: match.basis === 'id' ? 'marker' : match.basis,
+      // A marker join is exact; a text match that gVisor itself observed is
+      // corroborated. Recorded at capture, never promoted later.
+      confidence: markedCall ? 'exact' : 'corroborated', score: match.score,
+      windowStartMs: match.window_start ?? null, windowEndMs: match.window_end ?? null });
     matches.set(event.id, match);
   }
   return matches;
@@ -384,6 +461,16 @@ const server = createServer(async (req, res) => {
       if (raw) return json(200, base);
 
       const { commands, folded } = foldEvents(page.events);
+      // Which call each process belongs to, by the process's own identity
+      // (pid + start time) within this sandbox. `attribution` stays null when
+      // the process was not recorded yet -- not the same as unattributed,
+      // which is a recorded process that matched no call.
+      const known = new Map(db.attributionsForProcesses({ containerId: project.container_id, pids: commands.map((c) => c.pid) })
+        .map((row) => [`${row.pid}:${row.start_time_ns}`, row]));
+      for (const command of commands) {
+        const row = command.process_start_ns ? known.get(`${command.pid}:${command.process_start_ns}`) : null;
+        command.attribution = row ? { call_id: row.call_id ?? null, parent_call_id: row.parent_call_id ?? null, tier: row.tier ?? null } : null;
+      }
       // Cache first, so a repeat view of the same turn costs nothing. Only
       // commands no rule can describe are ever sent to a model.
       describeAll(commands, (command) => db.getCommandDescription(command));
@@ -405,7 +492,10 @@ const server = createServer(async (req, res) => {
           console.error('[raytace] command descriptions unavailable:', error.message);
         }
       }
-      return json(200, { ...base, commands, folded, events: undefined });
+      let call_labels = {};
+      try { call_labels = await assessCommands(commands); }
+      catch (error) { console.error('[raytace] command severity unavailable:', error.message); }
+      return json(200, { ...base, commands, folded, call_labels, severity_source: typesafe.enabled ? 'jev' : 'rules', events: undefined });
     } catch { return json(503, { error: 'Runtime evidence unavailable. Keep the manager and evidence viewer running. Missing evidence is not proof of non-execution.' }); }
   }
   if (req.method === 'GET' && (req.url === '/raytace/traces' || req.url === '/raytace/traces?scope=history')) {
@@ -438,7 +528,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && jobRoute[2] && req.headers['x-raytace-experiment'] === '1') { jobControllers.get(job.id)?.abort(); return json(200, job); }
     return json(405, { error: 'Unsupported experiment operation.' });
   }
-  if (localApi && (req.method !== 'POST' || !['/raytace/experiments', '/raytace/step-runs', '/raytace/explanations', '/raytace/summaries', '/raytace/executions', '/raytace/kernel-executions'].includes(req.url))) return json(404, { error: 'Unknown local endpoint.' });
+  if (localApi && (req.method !== 'POST' || !['/raytace/experiments', '/raytace/step-runs', '/raytace/explanations', '/raytace/summaries'].includes(req.url))) return json(404, { error: 'Unknown local endpoint.' });
   if (localApi && (req.headers['x-raytace-experiment'] !== '1' || !req.headers['content-type']?.includes('application/json'))) return json(403, { error: 'Use the experiment control in the dashboard.' });
   const parts = []; let bytes = 0;
   for await (const part of req) { bytes += part.length; if (bytes > (localApi ? 600_000 : 20_000_000)) return json(413, { error: 'Request too large.' }); parts.push(part); }
@@ -489,55 +579,6 @@ const server = createServer(async (req, res) => {
       }
       try { return json(200, await pendingSummaries.get(request.key)); } finally { pendingSummaries.delete(request.key); }
     } catch (error) { console.error('Summary generation failed:', error); return json(400, { error: error.message }); }
-  }
-  if (req.method === 'POST' && req.url === '/raytace/executions') {
-    // Fed by codex.mjs's rollout-log tailer: raw CommandExecution events
-    // parsed from Codex's own session log, not yet tied to a model call.
-    // Correlation happens here (not in codex.mjs) because it needs the
-    // tool_calls table, which only the proxy has direct access to. See
-    // execution-correlation.mjs for why this can't be a simple ID lookup.
-    try {
-      const { events } = JSON.parse(requestBody);
-      if (!Array.isArray(events) || !events.length) return json(200, { matched: 0, total: 0 });
-      const matches = ingestExecutions(events); // see ingestExecutions above -- same matcher the gVisor forwarder uses
-      return json(200, { matched: matches.size, total: events.length });
-    } catch (error) { return json(400, { error: error.message }); }
-  }
-  if (req.method === 'POST' && req.url === '/raytace/kernel-executions') {
-    // Fed by proxy/container-tracer.mjs: exec events read straight from the
-    // kernel for the Codex Docker container's own cgroup, independent of
-    // anything Codex's rollout log claims about itself. Resolves each to a
-    // call_id using the exact same matcher as the rollout-log path above
-    // (matching logic shouldn't differ by source), then confirms an
-    // existing tool_executions row in place -- see db.confirmKernelExecution
-    // and proxy/migrations/004_kernel_verification.sql for why this never
-    // inserts a competing second row. A kernel event that arrives before the
-    // rollout tailer's own row exists yet (a timing race, not a
-    // contradiction -- the tracer is near-instant, the rollout tailer polls
-    // every 1.5s) is simply not confirmed on this batch; it costs one
-    // missed confirmation, never a wrong one, and does not stay pending.
-    try {
-      const { events } = JSON.parse(requestBody);
-      if (!Array.isArray(events) || !events.length) return json(200, { confirmed: 0, total: 0 });
-      const timestamps = events.map((e) => e.timestamp).filter(Number.isFinite);
-      if (!timestamps.length) return json(200, { confirmed: 0, total: events.length });
-      const WINDOW_MS = 30_000;
-      // Unlike rollout ingestion, kernel confirmation must search rows that
-      // already have rollout evidence. In the usual ordering the rollout
-      // tailer writes first; using candidatesInWindow() here would exclude
-      // exactly the row the kernel event is supposed to confirm.
-      const candidates = db.kernelCandidatesInWindow(Math.min(...timestamps) - WINDOW_MS, Math.max(...timestamps) + WINDOW_MS);
-      const kernelEvents = events.map((e, i) => ({ id: `kernel-${i}`, command: e.command, timestamp: e.timestamp }));
-      const matches = matchBatch(kernelEvents, candidates, { windowMs: WINDOW_MS });
-      let confirmed = 0;
-      kernelEvents.forEach((ke, i) => {
-        const match = matches.get(ke.id);
-        if (!match) return;
-        const didConfirm = db.confirmKernelExecution({ call_id: match.call_id, match_score: match.score, pid: events[i].pid });
-        if (didConfirm) confirmed += 1;
-      });
-      return json(200, { confirmed, total: events.length });
-    } catch (error) { return json(400, { error: error.message }); }
   }
   if (req.method === 'POST' && req.url === '/raytace/step-runs') {
     try {
@@ -631,7 +672,7 @@ try {
 server.listen(port, '127.0.0.1', () => {
   const stats = db.stats();
   console.log(`RayTrace proxy listening on http://127.0.0.1:${server.address().port}`);
-  console.log(`Store: ${dbFile} (journal=${db.journal}, ${stats.exchanges} exchanges, ${stats.blobs.n} blobs)`);
+  console.log(`Store: ${dbFile} (journal=${db.journal}, ${stats.sessions} sessions, ${stats.turns} turns, ${stats.exchanges} exchanges, ${stats.processes} sandbox processes)`);
 });
 // gVisor sandbox evidence (worker/gvisor/): discovers sandboxes from the
 // Mac-side manager (:8799) and tails each one's process events from the
@@ -641,16 +682,23 @@ server.listen(port, '127.0.0.1', () => {
 const gvisorForwarder = process.env.RAYTACE_GVISOR_FORWARDER === '0' ? null : startGvisorForwarder({
   managerBase: process.env.RAYTACE_SANDBOX_MANAGER || 'http://127.0.0.1:8799',
   viewerBase: process.env.RAYTACE_EVIDENCE_VIEWER || 'http://127.0.0.1:8798',
-  ingest: (events, { sessionId }) => ingestExecutions(events, { sessionId, source: 'gvisor', kernel: true }),
-  finish: (row) => db.finishExecution(row),
+  ingest: (events, { sessionId }) => ingestExecutions(events, { sessionId }),
+  // Exits, found by the process's own identity (pid + start time), so an
+  // exit closes its process even after a proxy restart or for a process the
+  // forwarder never tracked.
+  finish: (row) => recordExit(row),
+  finishByProcess: (row) => recordExit(row),
+  // A sandbox whose remaining exits can no longer arrive.
+  lose: (row) => db.loseOpenProcesses({ containerId: row.container_id, reason: row.reason, raw: row.raw ?? null, ended: row.ended === true }),
   // Processes that ran underneath a matched call, and ones that matched
-  // nothing at all. Both were discarded before migration 005 gave them a
-  // row shape; see proxy/migrations/005_execution_provenance.sql.
-  descend: ({ exec, parent_call_id, tier }) => db.recordDescendant({
-    id: exec.id, parent_call_id, tier, pid: exec.pid, ppid: exec.ppid,
-    start_time_ns: exec.start_time_ns, argv: exec.argv, source: 'gvisor',
-    started_at: Number.isFinite(exec.timestamp) ? new Date(exec.timestamp).toISOString() : null,
-    status: 'running',
-  }),
+  // nothing at all (parent_call_id null): recorded either way.
+  descend: ({ exec, parent_call_id, session_id }) => {
+    const started = db.recordProcessStart({ containerId: exec.container_id, projectId: session_id ?? null, raw: exec.raw, startedMs: exec.timestamp });
+    if (parent_call_id && started?.eventId) db.attribute({ toolCallId: parent_call_id, eventId: started.eventId, method: 'inherited', confidence: 'corroborated' });
+  },
 });
+function recordExit(row) {
+  return db.recordProcessExit({ containerId: row.container_id, projectId: row.session_id ?? null, raw: row.raw,
+    endedMs: row.ended_ms ?? null, exit_code: row.exit_code ?? null, signal: row.signal ?? null });
+}
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { try { gvisorForwarder?.stop(); db.close(); } finally { process.exit(0); } });

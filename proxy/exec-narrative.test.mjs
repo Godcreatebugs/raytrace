@@ -217,3 +217,12 @@ test('pipeline stages nest under the shell that forked them, exec or no exec', (
   assert.deepEqual(commands.map((c) => c.parent_event_id), [null, 1, 1],
     'both stages hang off the shell, not off the top level');
 });
+
+test('a folded command keeps its process start time, so it can be matched to a call by pid + start', () => {
+  const { commands } = fold([
+    { ...exec(1, 265, 156, PREAMBLE), process_start_ns: '9000' },
+    { ...exec(2, 265, 156, ['/bin/bash', '-c', 'npm test']), process_start_ns: '9000' },
+  ]);
+  assert.equal(commands[0].event_id, 2, 'the tree keeps a different exec event than the first one...');
+  assert.equal(commands[0].process_start_ns, '9000', '...but the same process identity');
+});

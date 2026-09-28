@@ -21,21 +21,49 @@ export type CallVerification = {
   status: string | null;
   error: string | null;
   match_score: number | null;
-  match_basis: 'id' | 'text' | null;
-  /** Which witness wrote the execution row: Codex's own rollout log, or
-   * gVisor's SecCheck stream for a sandboxed session. */
+  /** 'window': command text matched inside the call's causal window (after
+   * the proposing request started, before its result was sent back). */
+  match_basis: 'id' | 'text' | 'window' | null;
+  /** Which witness observed the execution: 'gvisor' (the sandbox's
+   * SecCheck stream) is the only one. */
   source?: string | null;
-  /** True when a kernel-level layer (gVisor in sandbox mode, or the
-   * bpftrace sidecar in container mode) saw this program start, independent
-   * of anything the agent logged about itself. */
+  /** True when the sandbox runtime (gVisor) saw this program start,
+   * independent of anything the agent logged about itself. */
   kernel_confirmed?: boolean;
   tier?: Tier | null;
+  reported_check?: ReportedCheck | null;
   descendant_count?: number;
+  /** Position of the call in its response; with exchange_id, finds its step. */
+  output_index?: number;
+  /** The command the model proposed, without the shell wrapper. */
+  proposed?: string | null;
+  descendants?: Descendant[];
+} & ExecutionFields;
+
+/** The sandbox process a call actually ran as (runtime_processes, through
+ * its accepted attribution). Every field is null when nothing was observed
+ * for the call. Times are the proxy's clock; `window_*` are the causal window
+ * that justified a 'window' match (runtime_attributions). */
+export type ExecutionFields = {
+  exec_id?: string | null;
+  pid?: number | null;
+  start_time_ns?: string | null;
+  argv?: string[] | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  exit_code?: number | null;
+  window_start_ms?: number | null;
+  window_end_ms?: number | null;
 };
 
+/** The agent's own report of a finished call (runner exit code and wall
+ * time) against what the runtime observed — runtime_attributions.reported_check.
+ * Null when not comparable. */
+export type ReportedCheck = 'agrees' | 'exit_code_differs' | 'duration_differs';
+
 /** How an execution was attributed to the call it appears under, recorded at
- * capture and never recomputed by a later join — see
- * proxy/migrations/005_execution_provenance.sql.
+ * capture and never recomputed by a later join (runtime_attributions
+ * confidence: exact → mediated, corroborated, inferred).
  *
  *  mediated     the call id travelled with the process (RAYTRACE_CALL_ID)
  *  corroborated a text match an independent kernel witness also saw
@@ -53,6 +81,7 @@ export type Descendant = {
   tier: Tier;
   pid: number | null;
   ppid: number | null;
+  start_time_ns?: string | null;
   argv: string[];
   status: string | null;
   error: string | null;
@@ -75,6 +104,10 @@ export type Trace = {
   model: string;
   title: string;
   startedAt: string;
+  /** When the turn's last response landed. */
+  endedAt?: string;
+  /** The turn's final answer text, when the last response had any. */
+  answer?: string;
   events: TraceEvent[];
   evidence: ContextItem[];
   callVerifications?: CallVerification[];
@@ -106,7 +139,8 @@ export type ContextItem = {
   real_status?: string | null;
   real_error?: string | null;
   match_score?: number | null;
-  match_basis?: 'id' | 'text' | null;
+  match_basis?: 'id' | 'text' | 'window' | null;
+  reported_check?: ReportedCheck | null;
   source?: string | null;
   kernel_confirmed?: boolean;
   /** Attribution strength for this call's own execution row. */
@@ -115,7 +149,7 @@ export type ContextItem = {
    * records them has run (the gVisor forwarder; see step 3). */
   descendants?: Descendant[];
   descendant_count?: number;
-};
+} & ExecutionFields;
 
 export type Outcome = { key: string; label: string; calls: { name: string; arguments: unknown }[]; text: string };
 

@@ -82,3 +82,12 @@ test('cancellation and provider errors stop future paid requests and preserve pa
   assert.equal(failed.status,'failed'); assert.equal(failed.trials.length,1);
   assert.equal(failed.summary.baseline.failed,1); assert.equal(failed.summary.baseline.rate,null);
 });
+
+test('proposedCommand shows the command a call proposed, without the shell wrapper', async () => {
+  const { proposedCommand } = await import('./experiment-engine.mjs');
+  assert.equal(proposedCommand('{"cmd":"rm notes.md","workdir":"/workspace"}'), 'rm notes.md');
+  assert.equal(proposedCommand({ command: ['bash', '-lc', 'npm test'] }), 'npm test');
+  assert.equal(proposedCommand({ command: ['/bin/zsh', '-lc', 'git status'] }), 'git status');
+  assert.equal(proposedCommand({ command: ['ls', '-la'] }), 'ls -la');
+  assert.equal(proposedCommand('*** Begin Patch\n*** Update File: src/app.ts\n*** End Patch'), 'edited src/app.ts');
+});

@@ -59,7 +59,7 @@ npm run dev
 ```
 
 Open `http://localhost:3000` and send a request through the proxy. Captures are
-written to `.raytace/raytace.db` and appear in the dashboard automatically.
+written to `.raytace/evidence.db` and appear in the dashboard automatically.
 
 ### OpenRouter experiment mode
 
@@ -192,10 +192,10 @@ agent/client
     ▼
 local proxy (:8797) ──► OpenAI / Anthropic / OpenRouter
     │
-    ├──► SQLite trace store (.raytace/raytace.db)
+    ├──► SQLite evidence store (.raytace/evidence.db)
     ├──► dashboard (:3000)
     ├──► counterfactual experiment engine
-    └──► optional gVisor/container evidence forwarder
+    └──► gVisor sandbox evidence forwarder
 ```
 
 The dashboard is a Vite/Vinext React application. The proxy and experiment

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { toExecutionEvent, exitOutcome, msFromNs, processEvents, SandboxTracker, startGvisorForwarder } from './gvisor-forwarder.mjs';
+import { toExecutionEvent, toFailedExec, exitOutcome, msFromNs, processEvents, SandboxTracker, startGvisorForwarder, clockFromSamples, UNMEASURED_CLOCK } from './gvisor-forwarder.mjs';
 
 // Event shapes below mirror what worker/gvisor/collector.py writes and
 // viewer.py serves (see `decode()` there): timestamp_ns / process_start_ns
@@ -20,10 +20,13 @@ test('msFromNs converts the collector\'s ns strings and rejects garbage', () => 
 });
 
 test('toExecutionEvent maps exec_succeeded into the matcher shape with a collision-proof id', () => {
-  assert.deepEqual(toExecutionEvent(exec(42, 10, 1, ['/bin/bash', '-lc', 'git status'])), {
+  const raw = exec(42, 10, 1, ['/bin/bash', '-lc', 'git status']);
+  assert.deepEqual(toExecutionEvent(raw), {
     id: `gvisor-${'c'.repeat(12)}-42`, pid: 10, ppid: 1, command: '/bin/bash -lc git status',
     argv: ['/bin/bash', '-lc', 'git status'], cwd: '/workspace', timestamp: 1_700_000_000_042,
-    start_time_ns: null, call_marker: null,
+    start_time_ns: null, call_marker: null, margin: 2000,
+    // The observation itself travels with it, for the evidence store.
+    container_id: CONTAINER, raw,
   });
 });
 
@@ -44,11 +47,11 @@ test('toExecutionEvent rejects anything that is not a usable exec', () => {
 });
 
 test('exitOutcome never upgrades an unreadable exit to success', () => {
-  assert.deepEqual(exitOutcome({ exit_code: 0, signal: null }), { status: 'completed', error: null });
-  assert.deepEqual(exitOutcome({ exit_code: 2, signal: null }), { status: 'failed', error: 'exit 2' });
-  assert.deepEqual(exitOutcome({ exit_code: null, signal: 9 }), { status: 'failed', error: 'killed by signal 9' });
-  assert.deepEqual(exitOutcome({ exit_code: null, signal: null }), { status: 'unknown', error: null });
-  assert.deepEqual(exitOutcome(undefined), { status: 'unknown', error: null });
+  assert.deepEqual(exitOutcome({ exit_code: 0, signal: null }), { status: 'completed', error: null, exit_code: 0 });
+  assert.deepEqual(exitOutcome({ exit_code: 2, signal: null }), { status: 'failed', error: 'exit 2', exit_code: 2 });
+  assert.deepEqual(exitOutcome({ exit_code: null, signal: 9 }), { status: 'failed', error: 'killed by signal 9', exit_code: null });
+  assert.deepEqual(exitOutcome({ exit_code: null, signal: null }), { status: 'unknown', error: null, exit_code: null });
+  assert.deepEqual(exitOutcome(undefined), { status: 'unknown', error: null, exit_code: null });
 });
 
 /** ingest() fake: matches when the command text contains one of the given
@@ -77,7 +80,7 @@ test('a top-level bash -lc exec is forwarded and scoped to the sandbox session; 
   ], { sessionId: SESSION, tracker, ingest, finish: async (row) => { finished.push(row); return true; },
        descend: async (row) => { descended.push(row); } });
 
-  assert.deepEqual(counts, { forwarded: 1, matched: 1, finished: 2, descendants: 1, unattributed: 0 });
+  assert.deepEqual(counts, { forwarded: 1, matched: 1, finished: 2, descendants: 1, unattributed: 0, failedExecs: 0, lost: 0 });
   assert.equal(calls.length, 1, 'only the top-level exec reached the matcher');
   assert.equal(calls[0].opts.sessionId, SESSION);
   assert.equal(calls[0].events[0].command, '/bin/bash -lc git status');
@@ -120,7 +123,7 @@ test('an exec that matches nothing is recorded as unattributed rather than disca
     exec(1, 900, 1, ['curl', 'https://example.com']),
   ], { sessionId: SESSION, tracker, ingest, finish: async () => true, descend: async (row) => { descended.push(row); } });
 
-  assert.deepEqual(counts, { forwarded: 1, matched: 0, finished: 0, descendants: 0, unattributed: 1 });
+  assert.deepEqual(counts, { forwarded: 1, matched: 0, finished: 0, descendants: 0, unattributed: 1, failedExecs: 0, lost: 0 });
   assert.equal(descended.length, 1);
   assert.equal(descended[0].parent_call_id, null, 'belongs to no proposed call');
   assert.equal(descended[0].tier, 'unverified');
@@ -145,7 +148,7 @@ test('unmatched execs never occupy a pid, so their children remain eligible', as
     exec(1, 1, 0, ['codex']),
     exec(2, 50, 1, ['/bin/bash', '-lc', 'npm test']),
   ], { sessionId: SESSION, tracker, ingest, finish: async () => true });
-  assert.deepEqual(counts, { forwarded: 2, matched: 1, finished: 0, descendants: 0, unattributed: 1 });
+  assert.deepEqual(counts, { forwarded: 2, matched: 1, finished: 0, descendants: 0, unattributed: 1, failedExecs: 0, lost: 0 });
   assert.equal(calls.length, 2);
   assert.equal(tracker.live.get(50).execId, `gvisor-${'c'.repeat(12)}-2`);
   assert.equal(tracker.live.has(1), false);
@@ -181,7 +184,7 @@ test('events are processed in id order regardless of page order, and only past t
 test('malformed pages and events never throw', async () => {
   const tracker = new SandboxTracker();
   const deps = { sessionId: SESSION, tracker, ingest: async () => new Map(), finish: async () => true };
-  const none = { forwarded: 0, matched: 0, finished: 0, descendants: 0, unattributed: 0 };
+  const none = { forwarded: 0, matched: 0, finished: 0, descendants: 0, unattributed: 0, failedExecs: 0, lost: 0 };
   assert.deepEqual(await processEvents(undefined, deps), none);
   assert.deepEqual(await processEvents([null, {}, { kind: 'exec_succeeded' }, { event_id: 'x', kind: 'process_exit' }], deps), none);
 });
@@ -268,5 +271,98 @@ test('startGvisorForwarder logs an unreachable manager once and stays idle rathe
     assert.equal(logs.filter((m) => m.includes('sandbox manager not reachable')).length, 1);
     await forwarder.poll(); // nothing to poll; must not throw
     assert.equal(forwarder.sandboxes.size, 0);
+  } finally { forwarder.stop(); }
+});
+
+const BASE = 1_700_000_000_000;
+const PREFIX = `gvisor-${'c'.repeat(12)}-`;
+
+test('clockFromSamples trusts the shortest round trip, and is unmeasured with no samples', () => {
+  assert.deepEqual(clockFromSamples([{ offsetMs: 3100, rttMs: 40 }, { offsetMs: 2990, rttMs: 4 }, { offsetMs: 3500, rttMs: 900 }]),
+    { offsetMs: 2990, marginMs: 252, measured: true });
+  assert.equal(clockFromSamples([]), UNMEASURED_CLOCK);
+  assert.equal(clockFromSamples([{ offsetMs: NaN, rttMs: 1 }]), UNMEASURED_CLOCK);
+});
+
+test('exec times are shifted onto the proxy clock, carrying the measured margin', () => {
+  // The VM clock runs 3 s ahead: an exec it stamps at +3 s happened at +0 s for us.
+  const event = toExecutionEvent(exec(1, 10, 1, ['ls'], BASE + 3000), { offsetMs: 3000, marginMs: 260 });
+  assert.equal(event.timestamp, BASE);
+  assert.equal(event.margin, 260);
+});
+
+test('a failed execve under a matched command gets its own failed row instead of vanishing', async () => {
+  const tracker = new SandboxTracker();
+  tracker.live.set(100, { execId: `${PREFIX}1`, callId: 'call_x' });
+  const descended = [];
+  const failed = { event_id: 5, kind: 'exec_failed', pid: 101, ppid: 100, argv: ['./script.sh'], errno: 13, container_id: CONTAINER, timestamp_ns: NS(BASE + 5) };
+  const counts = await processEvents([failed], { sessionId: SESSION, tracker, ingest: async () => new Map(), finish: async () => true,
+    descend: async (row) => { descended.push(row); } });
+  assert.equal(counts.failedExecs, 1);
+  assert.equal(descended[0].parent_call_id, 'call_x');
+  assert.equal(descended[0].tier, 'corroborated');
+  assert.equal(descended[0].exec.status, 'failed');
+  assert.equal(descended[0].exec.error, 'exec failed: errno 13');
+  assert.equal(descended[0].exec.ended_at, new Date(BASE + 5).toISOString());
+  assert.equal(tracker.live.has(101), false, 'nothing ran, so nothing is tracked');
+  assert.equal(toFailedExec({ ...failed, argv: [], executable: '' }), null);
+});
+
+test('an exit with no in-memory link (proxy restarted) is closed by pid + start time', async () => {
+  const closed = [];
+  const counts = await processEvents([{ ...exit(9, 42, 3), process_start_ns: '555' }], {
+    sessionId: SESSION, tracker: new SandboxTracker(), ingest: async () => new Map(), finish: async () => { throw new Error('no live entry to finish'); },
+    finishByProcess: async (row) => { closed.push(row); return true; } });
+  assert.equal(counts.finished, 1);
+  const { raw, ...row } = closed[0];
+  assert.deepEqual(row, { container_id: CONTAINER, session_id: SESSION, pid: 42, start_time_ns: '555', ended_at: new Date(BASE + 9).toISOString(),
+    ended_ms: BASE + 9, status: 'failed', error: 'exit 3', exit_code: 3, signal: null });
+  assert.equal(raw.event_id, 9);
+});
+
+test('a sandbox\'s collector disconnecting marks its open rows unknown and forgets its live pids', async () => {
+  const tracker = new SandboxTracker();
+  tracker.live.set(100, { execId: `${PREFIX}1`, callId: 'call_x' });
+  const lost = [];
+  const counts = await processEvents([{ event_id: 7, kind: 'collector_disconnected', container_id: CONTAINER }], {
+    sessionId: SESSION, tracker, ingest: async () => new Map(), finish: async () => true,
+    lose: async (row) => { lost.push(row); return 2; } });
+  assert.deepEqual(lost, [{ container_id: CONTAINER, session_id: SESSION, reason: 'collector disconnected', raw: { event_id: 7, kind: 'collector_disconnected', container_id: CONTAINER } }]);
+  assert.equal(counts.lost, 2);
+  assert.equal(tracker.live.size, 0);
+});
+
+test('startGvisorForwarder measures the VM clock, falls back when it cannot, and closes out removed sandboxes', async () => {
+  let listed = true;
+  let timeUp = true;
+  const fetchImpl = async (url) => {
+    if (url.endsWith('/api/projects')) return { ok: true, json: async () => (listed ? [{ id: SESSION, container_id: CONTAINER }] : []) };
+    if (url.endsWith('/time')) {
+      if (!timeUp) throw new Error('connection refused');
+      return { ok: true, json: async () => ({ realtime_ns: NS(Date.now() + 3000) }) };
+    }
+    if (url.includes('/events?')) return { ok: true, json: async () => ({ events: [] }) };
+    throw new Error('unexpected ' + url);
+  };
+  const lost = [];
+  const logs = [];
+  const forwarder = startGvisorForwarder({ ingest: async () => new Map(), finish: async () => true, lose: async (row) => { lost.push(row); return 1; },
+    fetchImpl, log: (m) => logs.push(m), pollMs: 60_000, discoverMs: 60_000 });
+  try {
+    await forwarder.discover();
+    assert.equal(forwarder.clock().measured, true);
+    assert.ok(Math.abs(forwarder.clock().offsetMs - 3000) < 100, `offset ${forwarder.clock().offsetMs}`);
+
+    timeUp = false;
+    await forwarder.discover();
+    await forwarder.discover();
+    assert.equal(forwarder.clock().measured, true, 'a failed sample keeps the last good mapping');
+    assert.equal(logs.filter((m) => m.includes('could not read the sandbox clock')).length, 1, 'logged once per outage');
+
+    listed = false;
+    await forwarder.discover();
+    assert.equal(forwarder.sandboxes.size, 0);
+    assert.deepEqual(lost, [{ container_id: CONTAINER, session_id: SESSION, reason: 'sandbox removed', ended: true }]);
+    assert.ok(logs.some((m) => m.includes('is gone') && m.includes('1 open execution(s) marked unknown')));
   } finally { forwarder.stop(); }
 });

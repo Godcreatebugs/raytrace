@@ -1,5 +1,3 @@
-import { createHash } from 'node:crypto';
-
 export function latestSessionRows(rows) {
   const sessions = rows.filter((row) => row.session_id && row.session_started_at);
   const latest = sessions.reduce((best, row) => !best || row.session_started_at > best.session_started_at ? row : best, null);
@@ -33,18 +31,4 @@ export function promptInfo(payload) {
     return { title, prefix: JSON.stringify(input.slice(0, i + 1)), continuation: i < input.length - 1 };
   }
   return null;
-}
-
-export function groupPromptExchanges(rows) {
-  const active = new Map();
-  const result = [];
-  for (const row of [...rows].sort((a, b) => a.timestamp.localeCompare(b.timestamp))) {
-    const prompt = promptInfo(row.request?.payload);
-    if (!prompt) continue;
-    const key = createHash('sha256').update(JSON.stringify([row.session_id, row.provider, row.request?.payload?.model, prompt.prefix])).digest('hex');
-    const traceId = prompt.continuation && active.has(key) ? active.get(key) : row.span_id;
-    active.set(key, traceId);
-    result.push({ ...row, trace_id: traceId, promptTitle: prompt.title });
-  }
-  return result;
 }

@@ -61,7 +61,7 @@ for (const mode of ['native', 'openrouter']) test(`${mode}: HTTP capture → asy
   // Persistence completes after the final progress update. Everything now lands
   // in SQLite, so scan the database bytes directly: that also proves no
   // credential reached disk through any table, blob, or journal.
-  const onDisk = async () => (await Promise.all(['raytace.db','raytace.db-wal','raytace.db-journal']
+  const onDisk = async () => (await Promise.all(['evidence.db','evidence.db-wal','evidence.db-journal']
     .map((name)=>readFile(join(directory,name),'utf8').catch(()=>'')))).join('');
   let saved=''; for(let i=0;i<100;i++){saved=await onDisk();if(saved.includes('"status":"completed"'))break;await new Promise((r)=>setTimeout(r,20));}
   assert.match(saved,/"status":"completed"/);

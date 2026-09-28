@@ -111,6 +111,10 @@ export function fold(events) {
       argv,
       command: bareCommand(argv),
       started_ns: event.timestamp_ns ?? null,
+      // The process's own start time: with pid, the identity the dashboard
+      // uses to find which tool call this process belongs to. Stable across
+      // the re-execs this entry absorbs, unlike the event id kept above.
+      process_start_ns: typeof event.process_start_ns === 'string' ? event.process_start_ns : null,
       ended_ns: null,
       exit_code: null,
       signal: null,

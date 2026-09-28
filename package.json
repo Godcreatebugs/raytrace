@@ -23,10 +23,8 @@
     "sandbox:list": "python3 worker/gvisor/project_manager.py list",
     "test:engine": "node --disable-warning=ExperimentalWarning --test proxy/*.test.mjs",
     "format": "oxfmt",
-    "backfill": "node --disable-warning=ExperimentalWarning proxy/backfill.mjs",
     "docker:build:codex": "docker build -t raytace-codex -f docker/codex/Dockerfile .",
-    "docker:build:tracer": "docker build -t raytace-tracer docker/tracer",
-    "docker:build": "npm run docker:build:codex && npm run docker:build:tracer"
+    "docker:build": "npm run docker:build:codex"
   },
   "dependencies": {
     "@base-ui/react": "1.7.0",

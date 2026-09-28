@@ -1,8 +1,7 @@
-# Workload image: runs the Codex CLI itself, so its whole process tree
-# lives inside one container's pid namespace and cgroup -- that's what lets
-# docker/tracer/ scope to it with a single cgroup filter instead of the
-# machine-wide, unfilterable eslogger firehose this replaced (see
-# proxy/container-tracer.mjs).
+# Workload image: runs the Codex CLI itself, so its shell commands can only
+# touch what proxy/codex.mjs bind-mounts in (RAYTACE_CONTAINER=1). Captures
+# model traffic only; observed execution evidence comes from the gVisor
+# sandbox (worker/gvisor/).
 #
 # NOTE: verify the install line below matches how you actually install
 # Codex locally -- we couldn't confirm this from your Mac. Check with

@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { TOOL_RESULT_KINDS } from './tool-metadata.mjs';
 
 export const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const callTypes = new Set(['function_call', 'custom_tool_call', 'tool_use']);
-const resultTypes = new Set(['function_call_output', 'custom_tool_call_output', 'tool_result']);
+const resultTypes = new Set(TOOL_RESULT_KINDS);
 export const textOf = (item) => typeof item?.content === 'string' ? item.content : Array.isArray(item?.content) ? item.content.map((part) => part.text || '').join('\n') : item?.text || '';
 const clip = (value, max = 220) => String(value).slice(0, max);
 
@@ -13,7 +14,7 @@ const shortPath = (path) => path.trim().split('/').filter(Boolean).slice(-3).joi
 export function describeCall(argsRaw) {
   let script = String(argsRaw ?? '');
   try { const parsed = JSON.parse(script); script = String(parsed.script ?? parsed.cmd ?? parsed.command ?? parsed.input ?? script); } catch { /* raw string args */ }
-  if (/apply_patch/.test(script)) {
+  if (/apply_patch|\*\*\* Begin Patch/.test(script)) {
     const verbs = { Add: 'created', Update: 'edited', Delete: 'deleted' };
     const ops = [...script.matchAll(/\*{3} (Add|Update|Delete) File: ?([^\n"\\]+)/g)].map(([, verb, path]) => `${verbs[verb]} ${shortPath(path)}`);
     return ops.length ? `${ops.slice(0, 3).join(', ')}${ops.length > 3 ? ` and ${ops.length - 3} more files` : ''}` : 'applied a file patch';
@@ -21,6 +22,24 @@ export function describeCall(argsRaw) {
   const shell = script.match(/(?:exec|run|shell|bash)\(\s*["'`]([^"'`]+)/) || script.match(/^\s*([^\n(]{4,})/);
   const line = (shell?.[1] || script).split(/\\n|\n/).map((part) => part.trim()).find((part) => part.length > 5 && !/^(text|await|const|let|var|import|return)\b/.test(part));
   return line ? `ran: ${clip(line, 90)}` : 'ran a script';
+}
+/** The command a tool call proposed, as close to verbatim as its arguments
+ * allow, for showing next to the process that actually ran. Shell tools carry
+ * it as `cmd`/`command` (a string, or an argv whose `bash -lc` wrapper never
+ * appears in what the model meant); anything else, such as a patch, falls
+ * back to describeCall's plain-English reading. */
+export function proposedCommand(argsRaw) {
+  let args = argsRaw;
+  if (typeof args === 'string') { try { args = JSON.parse(args); } catch { /* raw string args */ } }
+  const value = args && typeof args === 'object' && !Array.isArray(args) ? (args.cmd ?? args.command ?? args.script) : args;
+  if (Array.isArray(value)) {
+    const parts = value.map(String);
+    const wrapped = /(^|\/)(ba|z)?sh$/.test(parts[0] || '') && /^-\w*c$/.test(parts[1] || '');
+    const text = (wrapped ? parts.slice(2) : parts).join(' ').trim();
+    if (text) return clip(text, 200);
+  }
+  if (typeof value === 'string' && value.trim() && !/\*\*\* Begin Patch|apply_patch/.test(value)) return clip(value.trim(), 200);
+  return describeCall(typeof argsRaw === 'string' ? argsRaw : JSON.stringify(argsRaw ?? ''));
 }
 export function evidenceFor(payload, exchangeId) {
   if (!Array.isArray(payload?.input)) return [];

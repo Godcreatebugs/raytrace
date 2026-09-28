@@ -43,8 +43,8 @@ next-env.d.ts
 /.raytace/
 *.tsbuildinfo
 
-# local database (generated; rebuild with `npm run backfill`)
-.raytace/raytace.db
-.raytace/raytace.db-wal
-.raytace/raytace.db-shm
-.raytace/raytace.db-journal
+# local evidence database (created by the proxy on first start)
+.raytace/evidence.db
+.raytace/evidence.db-wal
+.raytace/evidence.db-shm
+.raytace/evidence.db-journal

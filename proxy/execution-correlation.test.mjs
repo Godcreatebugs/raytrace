@@ -1,55 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { similarity, matchExecutionToCall, matchBatch, parseRolloutLine } from './execution-correlation.mjs';
-
-// Real rollout line shape, trimmed to what parseRolloutLine actually reads
-// (taken from the user's real ~/.codex session file, 2026-09-10).
-const realRolloutLine = JSON.stringify({
-  timestamp: '2026-09-10T13:13:07.712Z',
-  type: 'event_msg',
-  payload: {
-    type: 'item_completed',
-    item: {
-      type: 'CommandExecution',
-      id: 'exec-819cfa0f-b714-464c-bba0-5cf05651cbcf',
-      command: ['/bin/zsh', '-lc', "pwd; rg --files -g 'AGENTS.md' -g 'package.json'; git status --short"],
-      cwd: `file://${process.cwd()}`,
-      status: 'completed',
-      exit_code: 0,
-      duration: { secs: 0, nanos: 4625 },
-    },
-  },
-});
-
-test('parseRolloutLine extracts a completed CommandExecution', () => {
-  const parsed = parseRolloutLine(realRolloutLine);
-  assert.equal(parsed.id, 'exec-819cfa0f-b714-464c-bba0-5cf05651cbcf');
-  assert.match(parsed.command, /pwd; rg --files/);
-  assert.equal(parsed.status, 'completed');
-  assert.equal(parsed.exitCode, 0);
-  assert.equal(parsed.durationMs, 0); // 4625 nanoseconds rounds to 0ms
-  assert.equal(parsed.error, null);
-});
-
-test('parseRolloutLine ignores non-CommandExecution and malformed lines', () => {
-  assert.equal(parseRolloutLine('not json at all'), null);
-  assert.equal(parseRolloutLine(JSON.stringify({ payload: { type: 'item_completed', item: { type: 'AgentMessage' } } })), null);
-  assert.equal(parseRolloutLine(JSON.stringify({ payload: { type: 'turn_context' } })), null);
-});
-
-test('parseRolloutLine captures a failure', () => {
-  const line = JSON.stringify({
-    timestamp: '2026-09-10T13:14:00.000Z',
-    payload: { type: 'item_completed', item: {
-      type: 'CommandExecution', id: 'exec-2', command: ['/bin/zsh', '-lc', 'cat missing.txt'],
-      status: 'failed', exit_code: 1, stderr: 'cat: missing.txt: No such file or directory', duration: { secs: 0, nanos: 100000 },
-    } },
-  });
-  const parsed = parseRolloutLine(line);
-  assert.equal(parsed.status, 'failed');
-  assert.equal(parsed.exitCode, 1);
-  assert.match(parsed.error, /No such file/);
-});
+import { similarity, matchExecutionToCall, matchBatch } from './execution-correlation.mjs';
 
 test('similarity: identical command text scores 1.0 regardless of args shape', () => {
   const command = "rg -n 'cost|duration' app/request-metrics.tsx; cat proxy/request-metrics.mjs";
@@ -145,4 +96,51 @@ test('matchBatch never assigns the same call_id to two executions', () => {
   const candidates = [{ call_id: 'call_only_one', timestamp: 1_000_050, args: { command: 'npm test' } }];
   const results = matchBatch(execs, candidates);
   assert.equal(results.size, 1); // only one candidate existed; the other two executions stay unmatched
+});
+
+// Causal windows: a sandbox call can only have run after the request that
+// proposed it started, and before the agent sent its result back.
+const RM = { command: 'rm notes.md' };
+const causal = (call_id, window_start, window_end = null) => ({ call_id, timestamp: window_start, args: RM, window_start, window_end });
+
+test('causal window: a retried proposal cannot claim a run from before it existed, and vice versa', () => {
+  // call_a proposed at 0, result sent at 5 s; call_b (the retry) proposed at 10 s, still pending.
+  const candidates = [causal('call_a', 0, 5_000), causal('call_b', 10_000)];
+  assert.deepEqual(matchExecutionToCall({ command: '/bin/bash -lc rm notes.md', timestamp: 12_000, margin: 250 }, candidates),
+    { call_id: 'call_b', score: 1, basis: 'window', window_start: 10_000, window_end: null });
+  assert.equal(matchExecutionToCall({ command: 'rm notes.md', timestamp: 3_000, margin: 250 }, candidates).call_id, 'call_a');
+});
+
+test('causal window: a slow command still matches 45 s after its proposal (the old +-30 s window missed it)', () => {
+  const exec = { command: 'rm notes.md', timestamp: 45_000, margin: 250 };
+  assert.equal(matchExecutionToCall(exec, [causal('call_a', 0)])?.call_id, 'call_a');
+  assert.equal(matchExecutionToCall(exec, [{ call_id: 'call_a', timestamp: 0, args: RM }]), null, 'legacy candidates keep the old window');
+});
+
+test('causal window: a run that starts after the result was sent is not that call', () => {
+  assert.equal(matchExecutionToCall({ command: 'rm notes.md', timestamp: 8_000, margin: 250 }, [causal('call_a', 0, 5_000)]), null);
+  // ...but clock margin still absorbs measured skew at the edges.
+  assert.equal(matchExecutionToCall({ command: 'rm notes.md', timestamp: 5_200, margin: 250 }, [causal('call_a', 0, 5_000)])?.call_id, 'call_a');
+  assert.equal(matchExecutionToCall({ command: 'rm notes.md', timestamp: -200, margin: 250 }, [causal('call_a', 0, 5_000)])?.call_id, 'call_a');
+});
+
+test('causal window: a call that never reported back stops competing after the open-window cap', () => {
+  assert.equal(matchExecutionToCall({ command: 'rm notes.md', timestamp: 11 * 60_000, margin: 250 }, [causal('call_a', 0)]), null);
+});
+
+test('causal window: text is still required inside the window (agent helpers run while a call is pending)', () => {
+  assert.equal(matchExecutionToCall({ command: 'git status --short', timestamp: 1_000, margin: 250 }, [causal('call_a', 0)]), null);
+});
+
+test('causal window: two pending look-alikes resolve to the most recently opened one', () => {
+  const candidates = [causal('call_old', 0), causal('call_new', 20_000)];
+  assert.equal(matchExecutionToCall({ command: 'rm notes.md', timestamp: 21_000, margin: 250 }, candidates).call_id, 'call_new');
+});
+
+test('causal window: a window match carries the bounds that justified it', () => {
+  assert.deepEqual(matchExecutionToCall({ command: 'rm notes.md', timestamp: 3_000, margin: 250 }, [causal('call_a', 0, 5_000)]),
+    { call_id: 'call_a', score: 1, basis: 'window', window_start: 0, window_end: 5_000 });
+  // A legacy text match carries none.
+  assert.deepEqual(matchExecutionToCall({ command: 'rm notes.md', timestamp: 3_000 }, [{ call_id: 'call_a', timestamp: 0, args: RM }]),
+    { call_id: 'call_a', score: 1, basis: 'text' });
 });
