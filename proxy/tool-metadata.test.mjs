@@ -24,3 +24,15 @@ test('strip evidence previews and structured text tool results', () => {
   const item = omitToolChunkIds({ type: 'tool_result', content: [{ type: 'text', text: output }] });
   assert.ok(item.content[0].text.startsWith('Wall time:'));
 });
+test('toolResultFacts reads exit code and wall time from the runner header only', async () => {
+  const { toolResultFacts } = await import('./tool-metadata.mjs');
+  assert.deepEqual(toolResultFacts({ output }), { exitCode: 0, wallMs: 1 });
+  assert.deepEqual(toolResultFacts({ output: output.replace('code 0', 'code 3').replace('0.001', '1.5') }), { exitCode: 3, wallMs: 1500 });
+  // Still running: the wall time is how long Codex waited, not a run time.
+  assert.deepEqual(toolResultFacts({ output: 'Wall time: 10.0 seconds\nProcess running with session ID 7\nOutput:\n' }), { exitCode: null, wallMs: null });
+  // File contents that look like a header are not a header.
+  assert.deepEqual(toolResultFacts({ output: 'a file containing\nProcess exited with code 1' }), { exitCode: null, wallMs: null });
+  // The older shell tool's JSON metadata.
+  assert.deepEqual(toolResultFacts({ output: JSON.stringify({ output: 'ok', metadata: { exit_code: 2, duration_seconds: 0.25 } }) }), { exitCode: 2, wallMs: 250 });
+  assert.deepEqual(toolResultFacts(undefined), { exitCode: null, wallMs: null });
+});

@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import sqlite3
+import time
 from urllib.parse import urlparse, parse_qs
 
 def event_page(db, query):
@@ -35,7 +36,7 @@ def event_page(db, query):
     elif before:
         clauses.append('id < ?'); params.append(before)
     if query.get('processes', [''])[0] == '1':
-        clauses.append("kind IN ('exec_succeeded','process_exit','collection_gap','collection_error')")
+        clauses.append("kind IN ('exec_succeeded','exec_failed','process_exit','collection_gap','collection_error','collector_disconnected')")
     where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
     order = 'ASC' if after else 'DESC'
     rows = db.execute('SELECT id,body FROM runtime_events'+where+' ORDER BY id '+order+' LIMIT ?', (*params, limit+1)).fetchall()
@@ -73,6 +74,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == '/':
             body, mime = PAGE.encode(), 'text/html; charset=utf-8'
+        elif urlparse(self.path).path == '/time':
+            # The VM's realtime clock, which gVisor stamps events with. The
+            # proxy on the Mac samples this to map event times onto its own
+            # clock; the two drift apart, notably after the Mac sleeps.
+            body, mime = json.dumps({'realtime_ns': str(time.time_ns())}).encode(), 'application/json'
         elif urlparse(self.path).path == '/events':
             try:
                 with sqlite3.connect('file:/var/lib/raytace/runtime.db?mode=ro', uri=True) as db:

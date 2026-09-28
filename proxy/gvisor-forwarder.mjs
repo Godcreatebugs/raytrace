@@ -1,20 +1,13 @@
 /**
- * Turns gVisor process evidence from a sandbox into RayTrace execution rows,
- * so a sandboxed Codex session gets a real per-tool-call verdict instead of
- * every call defaulting to `not_executed`.
+ * Turns gVisor process evidence from a sandbox into RayTrace evidence rows
+ * (runtime_processes, runtime_events, runtime_attributions; see
+ * proxy/evidence-store.mjs), so a sandboxed Codex session gets a real
+ * per-tool-call verdict instead of every call defaulting to `not_executed`.
  *
- * Why this exists: in sandbox mode (`npm run sandbox:*`, see
- * worker/gvisor/README.md) neither of the existing execution witnesses can
- * run. The rollout tailer (proxy/execution-tailer.mjs) needs Codex's rollout
- * log, which lives in a memory-backed CODEX_HOME inside the sandbox that the
- * Mac cannot read; and the bpftrace sidecar (proxy/container-tracer.mjs)
- * only knows how to *confirm* rows the tailer already wrote. What the
- * sandbox does have is gVisor's SecCheck stream: every successful exec and
- * every process exit, reported by the layer that actually mediated the
- * syscall, collected outside the workload into a SQLite file and served on
- * the evidence viewer (:8798). This module tails that viewer and makes gVisor
- * the *primary* witness for sandbox sessions -- rows are written with
- * `source: 'gvisor'` and `kernel_confirmed = 1` at insert time.
+ * gVisor is the only execution witness: its SecCheck stream reports every
+ * exec and every process exit from the layer that actually mediated the
+ * syscall, collected outside the workload into a SQLite file in the VM and
+ * served on the evidence viewer (:8798). This module tails that viewer.
  *
  * Correctness stance is the same as execution-correlation.mjs: a missed
  * match only leaves a call `not_executed`; a wrong match mislabels real
@@ -23,21 +16,42 @@
  *      the broker stamps on every exchange), never the whole database.
  *   2. Only *top-level* execs are matched. Codex runs each tool call as
  *      `/bin/bash -lc <cmd>`; that bash then forks `git`, `ls`, `node`...
- *      Children of an already-matched command are skipped, and so is a
- *      re-exec in the same pid (bash exec()ing its last command in place),
- *      so a child's argv can never claim a *different* pending call.
+ *      Children of an already-matched command inherit its call instead of
+ *      being matched, and so does a re-exec in the same pid (bash exec()ing
+ *      its last command in place), so a child's argv can never claim a
+ *      *different* pending call.
  *   3. Events are processed one at a time, in event-id order, so a parent
  *      always claims its candidate before its children are even considered.
  *
- * Outcome is recorded in two steps because gVisor reports them in two
- * events: `exec_succeeded` writes the row with status 'running', and the
- * matching `process_exit` closes it out with the real exit code. Until the
- * exit arrives the UI keeps showing its text heuristic for that call rather
- * than asserting success or failure it doesn't have yet.
+ * Outcome arrives in two steps because gVisor reports it in two events:
+ * `exec_succeeded` records the process, and its `process_exit` closes it
+ * with the real exit code. Until the exit arrives the UI keeps showing its
+ * text heuristic for that call rather than asserting an outcome it lacks.
  */
 
 export const SANDBOX_ID = /^rtp-[a-f0-9]{32}$/;
 export const CONTAINER_ID = /^[a-f0-9]{64}$/;
+
+/** Mapping from the sandbox VM's clock to the proxy's. gVisor stamps events
+ * with the VM's realtime clock; exchanges are stamped by the proxy on the
+ * Mac. The two drift (notably after the Mac sleeps), so exec times are
+ * shifted by a measured offset before they are compared with exchange
+ * times, and `marginMs` is how uncertain that shift is. Unmeasured, the
+ * offset is assumed zero with a margin wide enough for ordinary drift. */
+export const UNMEASURED_CLOCK = Object.freeze({ offsetMs: 0, marginMs: 2000, measured: false });
+
+/** Picks the clock mapping from recent `/time` samples, NTP style: the
+ * sample with the shortest round trip has the least room for error. */
+export function clockFromSamples(samples) {
+  const usable = (samples ?? []).filter((s) => Number.isFinite(s?.offsetMs) && Number.isFinite(s?.rttMs) && s.rttMs >= 0);
+  if (!usable.length) return UNMEASURED_CLOCK;
+  const best = usable.reduce((a, b) => (b.rttMs < a.rttMs ? b : a));
+  return { offsetMs: best.offsetMs, marginMs: best.rttMs / 2 + 250, measured: true };
+}
+
+/** `gvisor-<container12>-`: the id prefix every row from one sandbox shares,
+ * which is how a pid (reused across sandboxes) is scoped back to its own. */
+export const rowPrefix = (containerId) => `gvisor-${typeof containerId === 'string' && containerId ? containerId.slice(0, 12) : 'unknown'}-`;
 
 /** ns-since-epoch (as the collector's string) -> ms, or null if unparseable. */
 export function msFromNs(ns) {
@@ -54,15 +68,15 @@ export function msFromNs(ns) {
  * never collide with Codex's exec-<uuid> / call_id-reused ids and so
  * re-ingesting the same event twice stays a no-op (recordExecution is
  * INSERT OR REPLACE on id). */
-export function toExecutionEvent(event) {
+export function toExecutionEvent(event, clock = UNMEASURED_CLOCK) {
   if (!event || event.kind !== 'exec_succeeded') return null;
   const argv = Array.isArray(event.argv) ? event.argv.filter((part) => typeof part === 'string') : [];
   const command = argv.join(' ').trim();
-  const timestamp = msFromNs(event.timestamp_ns);
+  const observed = msFromNs(event.timestamp_ns);
+  const timestamp = observed == null ? null : observed - clock.offsetMs;
   const pid = Number(event.pid);
   const eventId = Number(event.event_id);
   if (!command || timestamp == null || !Number.isFinite(pid) || !Number.isFinite(eventId)) return null;
-  const container = typeof event.container_id === 'string' ? event.container_id.slice(0, 12) : 'unknown';
   // `markers` is the collector's allowlisted RAYTRACE_* env (see
   // worker/gvisor/collector.py MARKER_KEYS). When RAYTRACE_CALL_ID is present
   // it IS the answer -- the call id travelled with the process -- and the
@@ -70,7 +84,7 @@ export function toExecutionEvent(event) {
   // in the spawn path stamps it, which is why the matcher stays the default.
   const marker = event.markers && typeof event.markers === 'object' ? event.markers.RAYTRACE_CALL_ID : null;
   return {
-    id: `gvisor-${container}-${eventId}`,
+    id: `${rowPrefix(event.container_id)}${eventId}`,
     pid,
     ppid: Number.isFinite(Number(event.ppid)) ? Number(event.ppid) : null,
     command,
@@ -79,17 +93,50 @@ export function toExecutionEvent(event) {
     timestamp,
     start_time_ns: typeof event.process_start_ns === 'string' ? event.process_start_ns : null,
     call_marker: typeof marker === 'string' && marker ? marker : null,
+    margin: clock.marginMs,
+    // The collector event itself, for the evidence store: it is recorded
+    // as observed, alongside the process it describes.
+    container_id: typeof event.container_id === 'string' ? event.container_id : null,
+    raw: event,
+  };
+}
+
+/** One collector `exec_failed` event (an execve that returned an error, so
+ * the program never ran and the calling process carried on) -> a row that
+ * is already finished as failed, or null if unusable. */
+export function toFailedExec(event, clock = UNMEASURED_CLOCK) {
+  if (!event || event.kind !== 'exec_failed') return null;
+  const argv = Array.isArray(event.argv) ? event.argv.filter((part) => typeof part === 'string') : [];
+  if (!argv.length && typeof event.executable === 'string' && event.executable) argv.push(event.executable);
+  const observed = msFromNs(event.timestamp_ns);
+  const pid = Number(event.pid);
+  const eventId = Number(event.event_id);
+  if (!argv.length || observed == null || !Number.isFinite(pid) || !Number.isFinite(eventId)) return null;
+  const at = new Date(observed - clock.offsetMs).toISOString();
+  return {
+    id: `${rowPrefix(event.container_id)}${eventId}`,
+    pid,
+    ppid: Number.isFinite(Number(event.ppid)) ? Number(event.ppid) : null,
+    command: argv.join(' ').trim(),
+    argv,
+    timestamp: observed - clock.offsetMs,
+    start_time_ns: typeof event.process_start_ns === 'string' ? event.process_start_ns : null,
+    status: 'failed',
+    error: `exec failed: errno ${Number.isFinite(Number(event.errno)) ? Number(event.errno) : 'unknown'}`,
+    ended_at: at,
+    container_id: typeof event.container_id === 'string' ? event.container_id : null,
+    raw: event,
   };
 }
 
 /** One collector `process_exit` event -> the status/error to close the row
  * with. Never guesses: an exit we can't read is 'unknown', not 'completed'. */
 export function exitOutcome(event) {
-  if (typeof event?.signal === 'number' && event.signal > 0) return { status: 'failed', error: `killed by signal ${event.signal}` };
+  if (typeof event?.signal === 'number' && event.signal > 0) return { status: 'failed', error: `killed by signal ${event.signal}`, exit_code: null };
   if (typeof event?.exit_code === 'number') {
-    return event.exit_code === 0 ? { status: 'completed', error: null } : { status: 'failed', error: `exit ${event.exit_code}` };
+    return event.exit_code === 0 ? { status: 'completed', error: null, exit_code: 0 } : { status: 'failed', error: `exit ${event.exit_code}`, exit_code: event.exit_code };
   }
-  return { status: 'unknown', error: null };
+  return { status: 'unknown', error: null, exit_code: null };
 }
 
 /** Per-sandbox tailing state: how far into the collector's event ids we've
@@ -118,10 +165,17 @@ export class SandboxTracker {
  * @param {(row: {exec: object, parent_call_id: string|null, tier: string}) => Promise<void>|void} [deps.descend]
  *   - records a process that ran underneath a call, or underneath nothing.
  *     Defaults to a no-op so existing callers keep their behaviour.
- * @returns {Promise<{forwarded: number, matched: number, finished: number, descendants: number, unattributed: number}>}
+ * @param {(row: object) => Promise<boolean>|boolean} [deps.finishByProcess]
+ *   - closes a process by its identity (pid + start time) when `tracker.live`
+ *     holds no link to it (after a proxy restart, or an unattributed process,
+ *     never tracked). Same row shape as `finish`.
+ * @param {(row: {container_id: string, session_id: string, reason: string, raw?: object, ended?: boolean}) => Promise<number>|number} [deps.lose]
+ *   - marks a sandbox's open rows `unknown` once their exits can no longer arrive.
+ * @param {{offsetMs: number, marginMs: number}} [deps.clock] - VM->proxy clock mapping
+ * @returns {Promise<{forwarded: number, matched: number, finished: number, descendants: number, unattributed: number, failedExecs: number, lost: number}>}
  */
-export async function processEvents(events, { sessionId, tracker, ingest, finish, descend = () => {} }) {
-  const counts = { forwarded: 0, matched: 0, finished: 0, descendants: 0, unattributed: 0 };
+export async function processEvents(events, { sessionId, tracker, ingest, finish, descend = () => {}, finishByProcess = () => false, lose = () => 0, clock = UNMEASURED_CLOCK }) {
+  const counts = { forwarded: 0, matched: 0, finished: 0, descendants: 0, unattributed: 0, failedExecs: 0, lost: 0 };
   const ordered = (Array.isArray(events) ? events : [])
     .filter((event) => Number.isFinite(Number(event?.event_id)) && Number(event.event_id) > tracker.cursor)
     .sort((a, b) => Number(a.event_id) - Number(b.event_id));
@@ -129,7 +183,7 @@ export async function processEvents(events, { sessionId, tracker, ingest, finish
   for (const event of ordered) {
     tracker.cursor = Number(event.event_id);
     if (event.kind === 'exec_succeeded') {
-      const exec = toExecutionEvent(event);
+      const exec = toExecutionEvent(event, clock);
       if (!exec) continue;
       // Same pid already carrying a matched command: bash exec()ing its last
       // command in place. Still one process doing one job -- recording it
@@ -145,7 +199,7 @@ export async function processEvents(events, { sessionId, tracker, ingest, finish
       // deletion is a grandchild; a one-level check never reached it).
       const owner = exec.ppid != null ? tracker.live.get(exec.ppid) : null;
       if (owner) {
-        await descend({ exec, parent_call_id: owner.callId, tier: owner.callId ? 'corroborated' : 'unverified' });
+        await descend({ exec, parent_call_id: owner.callId, tier: owner.callId ? 'corroborated' : 'unverified', session_id: sessionId });
         tracker.live.set(exec.pid, { execId: exec.id, callId: owner.callId });
         counts.descendants += 1;
         continue;
@@ -163,18 +217,46 @@ export async function processEvents(events, { sessionId, tracker, ingest, finish
         // and neither was storable before 005. Deliberately NOT tracked in
         // `live`: leaving its children to face the matcher keeps every
         // existing match outcome identical, so this path only adds rows.
-        await descend({ exec, parent_call_id: null, tier: 'unverified' });
+        await descend({ exec, parent_call_id: null, tier: 'unverified', session_id: sessionId });
         counts.unattributed += 1;
       }
+    } else if (event.kind === 'exec_failed') {
+      // The program never started, so there is no exec_succeeded and no row
+      // for it -- a forked child whose execve failed used to vanish. The
+      // calling process carries on (bash reports the error and exits), so
+      // its own row still closes normally. Not added to `live`: nothing ran.
+      const failed = toFailedExec(event, clock);
+      if (!failed) continue;
+      const owner = tracker.live.get(failed.pid) ?? (failed.ppid != null ? tracker.live.get(failed.ppid) : null);
+      await descend({ exec: failed, parent_call_id: owner?.callId ?? null, tier: owner?.callId ? 'corroborated' : 'unverified', session_id: sessionId });
+      counts.failedExecs += 1;
     } else if (event.kind === 'process_exit') {
       const pid = Number(event.pid);
-      const entry = tracker.live.get(pid);
-      if (!entry) continue;
-      tracker.live.delete(pid);
       const endedMs = msFromNs(event.timestamp_ns);
-      const { status, error } = exitOutcome(event);
-      await finish({ id: entry.execId, ended_at: endedMs == null ? null : new Date(endedMs).toISOString(), status, error });
-      counts.finished += 1;
+      const ended_at = endedMs == null ? null : new Date(endedMs - clock.offsetMs).toISOString();
+      const { status, error, exit_code } = exitOutcome(event);
+      const exitRow = { ended_at, ended_ms: endedMs == null ? null : endedMs - clock.offsetMs, status, error, exit_code,
+        signal: typeof event.signal === 'number' && event.signal > 0 ? event.signal : null,
+        pid, start_time_ns: typeof event.process_start_ns === 'string' ? event.process_start_ns : null,
+        container_id: typeof event.container_id === 'string' ? event.container_id : null, session_id: sessionId, raw: event };
+      const entry = tracker.live.get(pid);
+      if (entry) {
+        tracker.live.delete(pid);
+        await finish({ id: entry.execId, ...exitRow });
+        counts.finished += 1;
+      } else if (exitRow.start_time_ns) {
+        // No in-memory link: the process was seen before a proxy restart, or
+        // was never tracked (unattributed). Found again by pid + start time.
+        const closed = await finishByProcess(exitRow);
+        if (closed) counts.finished += 1;
+      }
+    } else if (event.kind === 'collector_disconnected' && typeof event.container_id === 'string' && event.container_id) {
+      // This sandbox's evidence stream ended. Exits for processes still
+      // open can no longer arrive, so they become unknown -- not failed.
+      // A later exit on a new connection still closes them (see
+      // finishExecutionByProcess), since real evidence beats "lost".
+      counts.lost += Number(await lose({ container_id: event.container_id, session_id: sessionId, reason: 'collector disconnected', raw: event })) || 0;
+      tracker.live.clear();
     }
   }
   return counts;
@@ -194,6 +276,8 @@ export function startGvisorForwarder({
   ingest,
   finish,
   descend,
+  finishByProcess,
+  lose,
   log = (message) => console.error(message),
   fetchImpl = globalThis.fetch,
   pollMs = 1500,
@@ -207,6 +291,9 @@ export function startGvisorForwarder({
   const sandboxes = new Map(); // container_id -> { sessionId, tracker }
   let managerDown = false;
   let viewerDown = false;
+  let clockDown = false;
+  let clock = UNMEASURED_CLOCK;
+  const clockSamples = []; // most recent last; bounded
   let discovering = null; // in-flight promise, so a concurrent call awaits it instead of racing
   let polling = null;
   let stopped = false;
@@ -235,13 +322,38 @@ export function startGvisorForwarder({
     discovering = discoverOnce().finally(() => { discovering = null; });
     return discovering;
   };
+  /** One NTP-style sample of the VM clock against ours. Keeps the last few;
+   * a failed sample leaves the previous mapping in place, and with none at
+   * all the forwarder runs unmeasured (zero offset, wide margin). */
+  const sampleClock = async () => {
+    try {
+      const sent = Date.now();
+      const body = await getJson(`${viewerBase}/time`);
+      const received = Date.now();
+      const vmMs = msFromNs(body?.realtime_ns);
+      if (vmMs == null) throw new Error('no realtime_ns in /time response');
+      clockSamples.push({ offsetMs: vmMs - (sent + received) / 2, rttMs: received - sent });
+      if (clockSamples.length > 5) clockSamples.shift();
+      clock = clockFromSamples(clockSamples);
+      if (clockDown) { clockDown = false; log('[raytace][gvisor] sandbox clock measurable again'); }
+    } catch (error) {
+      if (!clockDown) {
+        clockDown = true;
+        log(`[raytace][gvisor] could not read the sandbox clock at ${viewerBase}/time (${error.message}) -- matching with a ${clock.marginMs} ms margin until it can`);
+      }
+    }
+  };
+
   const discoverOnce = async () => {
     try {
       const projects = await getJson(`${managerBase}/api/projects`);
+      await sampleClock();
+      const present = new Set();
       for (const project of Array.isArray(projects) ? projects : []) {
         const sessionId = project?.id;
         const containerId = project?.container_id;
         if (!SANDBOX_ID.test(sessionId || '') || !CONTAINER_ID.test(containerId || '')) continue;
+        present.add(containerId);
         if (!sandboxes.has(containerId)) {
           const tracker = new SandboxTracker();
           // Start from the newest event, not from zero. The collector's
@@ -256,6 +368,15 @@ export function startGvisorForwarder({
           sandboxes.set(containerId, { sessionId, tracker });
           log(`[raytace][gvisor] forwarding evidence for sandbox ${sessionId} (container ${containerId.slice(0, 12)}) from event ${tracker.cursor}`);
         }
+      }
+      // A sandbox the manager no longer lists is gone, and so is any exit
+      // its open rows were waiting for. Only on a successful listing: an
+      // unreachable manager proves nothing about the sandboxes.
+      for (const [containerId, { sessionId }] of sandboxes) {
+        if (present.has(containerId)) continue;
+        sandboxes.delete(containerId);
+        const lost = typeof lose === 'function' ? Number(await lose({ container_id: containerId, session_id: sessionId, reason: 'sandbox removed', ended: true })) || 0 : 0;
+        log(`[raytace][gvisor] sandbox ${sessionId} is gone; stopped forwarding${lost ? `, ${lost} open execution(s) marked unknown` : ''}`);
       }
       if (managerDown) { managerDown = false; log('[raytace][gvisor] sandbox manager reachable again'); }
     } catch (error) {
@@ -284,11 +405,14 @@ export function startGvisorForwarder({
       // An ingest/finish failure (e.g. a DB error) must not stall the loop
       // or leave the cursor wedged; log it and move on to the next poll.
       try {
-        const counts = await processEvents(page?.events, { sessionId, tracker, ingest, finish, descend });
-        if (counts.matched || counts.finished || counts.descendants || counts.unattributed) {
+        const counts = await processEvents(page?.events, { sessionId, tracker, ingest, finish, descend,
+          ...(typeof finishByProcess === 'function' ? { finishByProcess } : {}),
+          ...(typeof lose === 'function' ? { lose } : {}),
+          clock });
+        if (counts.matched || counts.finished || counts.descendants || counts.unattributed || counts.failedExecs || counts.lost) {
           log(`[raytace][gvisor] ${sessionId.slice(0, 12)}: ${counts.matched} exec(s) matched to proposed calls, `
-            + `${counts.descendants} descendant(s), ${counts.unattributed} unattributed, `
-            + `${counts.finished} closed out, ${counts.forwarded} top-level exec(s) considered`);
+            + `${counts.descendants} descendant(s), ${counts.unattributed} unattributed, ${counts.failedExecs} failed exec(s), `
+            + `${counts.finished} closed out, ${counts.lost} marked unknown, ${counts.forwarded} top-level exec(s) considered`);
         }
       } catch (error) {
         log(`[raytace][gvisor] ${sessionId.slice(0, 12)}: failed to record evidence: ${error.message}`);
@@ -307,5 +431,7 @@ export function startGvisorForwarder({
     sandboxes,
     discover,
     poll,
+    /** Test/inspection hook: the VM->proxy clock mapping in use. */
+    clock: () => clock,
   };
 }

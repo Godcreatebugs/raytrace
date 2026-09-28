@@ -55,6 +55,10 @@ for that; the forwarder discovers sandboxes through the manager.
 
 ## Evidence boundaries
 
+The standalone [filesystem syscall catalog](SYSCALL_CATALOG.md) defines operation
+categories and impact levels for future file evidence. It is a reference only;
+importing it does not enable additional tracing.
+
 `exec_succeeded` comes from gVisor's successful exec checkpoint, not agent output.
 Attempts, clones, exits, raw packets and reported drop counts are also retained.
 In release-20260817.0, the structured exec return reported zero for a missing

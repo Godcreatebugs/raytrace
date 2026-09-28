@@ -1,6 +1,6 @@
 # RayTrace capture proxy
 
-Run `npm run proxy`. Set a compatible client base URL to `http://127.0.0.1:8797`; exchanges are forwarded to OpenAI or Anthropic and appended to `.raytace/events.jsonl`.
+Run `npm run proxy`. Set a compatible client base URL to `http://127.0.0.1:8797`; exchanges are forwarded to OpenAI or Anthropic and recorded in `.raytace/evidence.db`.
 
 Port 8797 is the default (moved off 8787 because another local tool was using it). Set `RAYTACE_PORT` in `.env` to change the port for both the proxy and Codex launcher.
 
@@ -8,42 +8,42 @@ Configure alternate endpoints with `RAYTACE_OPENAI_UPSTREAM` and `RAYTACE_ANTHRO
 
 ## Storage
 
-Captures are stored in SQLite at `.raytace/raytace.db`, created automatically on
-first run. There is nothing to install and no service to start: the database
-engine is `node:sqlite`, built into Node 22, so `npm install && npm run proxy`
-remains the whole setup.
+Captures are stored in SQLite at `.raytace/evidence.db`, created automatically
+on first run by `proxy/init-evidence-db.mjs`. There is nothing to install and no
+service to start: the engine is `node:sqlite`, built into Node 22.
 
-Large payloads are content-addressed. An agent resends its entire history and
-tool schema on every turn, so context items are hashed and stored once, then
-referenced by each request that included them. On a real 842-exchange capture
-this took the store from 83.6 MB of JSONL to 26.3 MB, with 14,651 context-item
-positions resolving to 1,291 distinct texts. Loading the live dashboard went
-from a 664 ms full-file scan on every poll to a 29 ms indexed query, and looking
-up a single step from that same full scan to 6 ms.
+The schema is `proxy/schema/*.sql` (see `proxy/schema/EVIDENCE_DATABASE.md`),
+and `proxy/evidence-store.mjs` is the only module that reads or writes it:
 
-Migrating an existing capture is one command:
+- **Agent intent**, written as each model request is captured:
+  `agent_sessions` → `agent_turns` (one user prompt and the agent's work on it)
+  → `agent_exchanges` (one model request) → `agent_tool_calls` (proposals, with
+  the agent's reported result). Which turn a request belongs to is decided once,
+  here: a new user message opens a turn, requests that carry the same
+  conversation plus the agent's own work continue it, and background jobs
+  (title generation, catch-ups) belong to none.
+- **Runtime evidence**, written by the gVisor forwarder: `runtime_sandboxes`,
+  `runtime_processes` (identified by pid + start time), `runtime_events`, and
+  `runtime_attributions` tying a process to the call it ran for.
+- **Classification** and **file context** tables exist and stay empty until file
+  syscalls are captured.
+- **Auxiliary**: lab experiments, cached summaries and explanations, command
+  descriptions, proxy errors.
 
-```
-npm run backfill
-```
+Payloads are content-addressed in `agent_payloads`. An agent resends its entire
+history and tool list on every request, so each input item and the tool list are
+stored once and referenced by every request that included them.
 
-It streams `.raytace/events.jsonl` into the database and leaves the original
-file untouched as a cold archive. It is idempotent — rows are replaced by
-`span_id`, so re-running it never duplicates anything. Once it succeeds the
-proxy no longer reads or writes the JSONL file; set `RAYTACE_ARCHIVE_JSONL=1`
-to keep appending to it as well.
+`RAYTACE_DB` overrides the database path. There are no migrations: the database
+carries `PRAGMA user_version = 2`, and anything else (an older database, a
+changed schema) is refused untouched; delete it to start fresh. Write-ahead
+logging is enabled where the filesystem supports it, so the dashboard can read
+while the proxy writes; on mounts that cannot provide it the store falls back
+to a rollback journal. `RAYTACE_ARCHIVE_JSONL=1` also appends each raw capture
+to `.raytace/events.jsonl`.
 
-`RAYTACE_DB` overrides the database path. Schema changes are numbered files in
-`proxy/migrations/`, applied once at startup and tracked with `PRAGMA
-user_version`. Write-ahead logging is enabled where the filesystem supports it,
-which lets the dashboard read while the proxy writes; on network or sync-folder
-mounts that cannot provide it, the store falls back to a rollback journal rather
-than refusing to start. The startup banner reports which mode is in use.
-
-Proposed tool calls are recorded in `tool_calls` as they are captured. The
-`tool_executions` table is written by the (not yet built) execution reporting
-path; until then a proposed call with no matching execution row reports as
-`not_executed`, which is the intended signal rather than missing data.
+A proposed call with no attributed process reports as `not_executed`: nothing
+was observed for it, which is not proof that it never ran.
 
 ## Optional OpenRouter routing
 
@@ -57,37 +57,31 @@ RAYTACE_OPENROUTER_MODEL=coder
 
 Run `npm run proxy` in one terminal, then `npm run codex` in another. The launcher uses a temporary Codex provider pointed at RayTrace and leaves your saved Codex settings untouched. Additional CLI arguments work, for example `npm run codex -- --model deepseek`.
 
-### Containerized Codex + kernel-level execution verification (opt-in)
+### Containerized Codex (opt-in)
 
-Set `RAYTACE_CONTAINER=1` before `npm run codex` to run Codex's entire process inside a Docker container instead of directly on this machine, and to get an independent, kernel-level cross-check of what actually ran:
+Set `RAYTACE_CONTAINER=1` before `npm run codex` to run Codex's entire process inside a Docker container instead of directly on this machine, so its shell commands can only touch what is explicitly bind-mounted in (your project directory and `CODEX_HOME`, not your whole home directory):
 
 ```
 npm run docker:build     # once, or whenever docker/ changes
 RAYTACE_CONTAINER=1 npm run codex
 ```
 
-Two things this buys you: Codex's shell commands can only touch what's explicitly bind-mounted in (your project directory and `CODEX_HOME`, not your whole home directory), and a second Docker container runs `bpftrace` scoped to the Codex container's own cgroup, watching its exec/exit activity straight from the kernel -- see `proxy/container-tracer.mjs`. A confirmed row shows up as `kernel_confirmed = 1` on the same `tool_executions` row the rollout tailer already wrote (see `proxy/migrations/004_kernel_verification.sql`), never a second, competing row.
+This mode captures model traffic only. Observed execution evidence comes from the gVisor sandbox below.
 
-This replaces an earlier macOS-only approach built on `eslogger`, which turned out to be an unfilterable, whole-machine firehose with a real, measured CPU/IO cost, and which Apple's own docs say isn't meant for programmatic use. Scoping by container cgroup instead of by a hand-maintained process tree fixes both problems at once, and the same approach works on Linux and (via Docker Desktop) Windows, not just macOS.
-
-**Known rough edges, since this hasn't been run end-to-end yet:**
 - `docker/codex/Dockerfile` assumes Codex installs via `npm install -g @openai/codex`. If that's not how you installed it locally, edit that line before building.
-- The tracer sidecar runs `--privileged`. That's a real capability grant on your machine, scoped to a container that only runs `bpftrace` for the duration of your Codex session -- narrower capability flags (`--cap-add=BPF`, etc.) are a possible follow-up once this is confirmed working, but privileged is the safer starting point given kernel/BTF version differences aren't something we could test in advance.
-- `RAYTACE_PROVIDER=native` (i.e. not routing through OpenRouter) is untested in container mode: Codex's own `~/.codex/config.toml` may point at `127.0.0.1`, which won't resolve to this Mac from inside the container. OpenRouter mode (the default path documented above) rewrites the base URL automatically and doesn't have this problem.
+- `RAYTACE_PROVIDER=native` is untested in container mode: Codex's own `~/.codex/config.toml` may point at `127.0.0.1`, which won't resolve to this Mac from inside the container. OpenRouter mode rewrites the base URL automatically.
 
 
 ### gVisor sandbox sessions: per-call verdicts from the sandbox's own evidence
 
-Sessions started through the gVisor sandbox (`npm run sandbox:*`, see `worker/gvisor/README.md`) can't use either of the witnesses above: Codex's rollout log lives in a memory-backed `CODEX_HOME` inside the sandbox that this Mac can't read, and the bpftrace sidecar only *confirms* rows the rollout tailer already wrote. For those sessions the proxy runs a forwarder (`proxy/gvisor-forwarder.mjs`) that makes gVisor the **primary** witness instead:
+gVisor is the only execution witness. For sessions started through the gVisor sandbox (`npm run dev:all`, or `npm run sandbox:*`; see `worker/gvisor/README.md`) the proxy runs a forwarder (`proxy/gvisor-forwarder.mjs`):
 
-1. It asks the sandbox manager (`npm run sandbox:manager`, `:8799/api/projects`) which `rtp-…` sandbox ids map to which container ids.
-2. It tails each container's `exec_succeeded` / `process_exit` events from the evidence viewer (`:8798/events?after=<cursor>`, port-forwarded out of the Lima VM).
-3. Each *top-level* exec (Codex's `/bin/bash -lc <cmd>` wrapper; children of an already-matched command are skipped) goes through the same `matchBatch()` matcher as the rollout tailer, scoped to that sandbox's session id only, and lands in `tool_executions` with `source = 'gvisor'`, `status = 'running'`, and `kernel_confirmed = 1`.
-4. The matching `process_exit` closes the row with the real exit code (`completed`, or `failed` with `exit N` / `killed by signal N`).
+1. It asks the sandbox manager (`:8799/api/projects`) which `rtp-…` sandbox ids map to which container ids, and samples the VM's clock (`:8798/time`) to map sandbox event times onto the proxy's.
+2. It tails each container's `exec_succeeded` / `exec_failed` / `process_exit` events from the evidence viewer (`:8798/events?after=<cursor>`, port-forwarded out of the Lima VM). Every process is recorded in `runtime_processes`, whether or not it matches a call.
+3. Each *top-level* exec (Codex's `/bin/bash -lc <cmd>` wrapper) is matched against that session's proposed calls by command text **inside the call's causal window**: after the request that proposed it started, before the request that carried its result back. A match becomes a `runtime_attributions` row (`method = 'window'`); processes it starts inherit the call (`method = 'inherited'`). A process carrying `RAYTRACE_CALL_ID` is joined exactly (`method = 'marker'`).
+4. Its `process_exit` closes the process with the real exit code, found by pid + start time so it works across proxy restarts. The agent's own reported exit code and wall time are checked against it (`reported_check`).
 
-On the dashboard this shows as a **Sandbox-verified** badge (or **Sandbox: running** until the exit arrives) on the Decision Chain, alongside the existing raw "Independent sandbox execution evidence" timeline. Nothing about the matching is looser than before: an exec that doesn't clear the same similarity bar stays `not_executed`, and a wrong match is still the failure mode this is tuned against.
-
-The forwarder is on by default and best-effort: with no manager or VM running it logs one line and idles. `RAYTACE_GVISOR_FORWARDER=0` disables it; `RAYTACE_SANDBOX_MANAGER` / `RAYTACE_EVIDENCE_VIEWER` override the two base URLs. After changing `worker/gvisor/viewer.py` (it gained the `after` cursor for this), push it into the VM without a full re-setup:
+An exec that doesn't clear the similarity bar stays recorded but unattributed, and its call stays `not_executed`: a wrong match is the failure mode this is tuned against. The forwarder is on by default and best-effort: with no manager or VM running it logs one line and idles. `RAYTACE_GVISOR_FORWARDER=0` disables it; `RAYTACE_SANDBOX_MANAGER` / `RAYTACE_EVIDENCE_VIEWER` override the two base URLs. After changing `worker/gvisor/collector.py` or `viewer.py`, push them into the VM without a full re-setup, then restart running sandboxes so they reconnect to the collector:
 
 ```
 limactl copy worker/gvisor/viewer.py raytace-gvisor:/tmp/viewer.py
@@ -96,7 +90,7 @@ limactl shell raytace-gvisor sudo systemctl restart raytace-viewer
 ```
 
 
-The OpenRouter launcher labels each new Codex launch as a separate session. Once its first response is captured, the dashboard shows the latest session only and switches away from older prompts automatically. The Compare runs picker loads the most recent 100 saved runs across all sessions, including older captures without session tracking. The main timeline remains scoped to the latest session. Restarting the dashboard does not delete captures. Older sessions remain in `.raytace/events.jsonl`; captures made before session tracking stay hidden. Clients without session headers are grouped by proxy run, so restart the proxy to start a fresh group for those clients.
+The OpenRouter launcher labels each new Codex launch as a separate session. Once its first response is captured, the dashboard shows the latest session only and switches away from older prompts automatically. The Compare runs picker loads the most recent 100 saved runs across all sessions, including older captures without session tracking. The main timeline remains scoped to the latest session. Restarting the dashboard does not delete captures; older sessions stay in the database. Clients without session headers are grouped by proxy run, so restart the proxy to start a fresh group for those clients.
 
 To switch back, comment out **only** `RAYTACE_PROVIDER=openrouter`, restart the proxy, and launch a **new session** with `npm run codex`. The launcher then invokes ordinary Codex with your existing configuration and authentication. Native capture still requires your existing client base-URL setup. Existing shell environment variables take precedence over `.env`; unset an exported `RAYTACE_PROVIDER` if necessary.
 
