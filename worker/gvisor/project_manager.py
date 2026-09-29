@@ -176,6 +176,8 @@ def serve():
         def do_POST(self):
             if self.path in ('/v1/responses','/v1/chat/completions'):
                 return project_broker.forward(self, STATE)
+            if self.path == '/raytace/ingest/claude-code':
+                return project_broker.forward_transcript(self, STATE)
             if not self.valid_host() or self.headers.get('X-RayTrace-Token') != token or self.headers.get('Origin') not in ('http://localhost:8799','http://127.0.0.1:8799'):
                 return self.respond(403, {'error':'Invalid request origin or token'})
             if self.path != '/api/action': return self.respond(404, {'error':'Not found'})

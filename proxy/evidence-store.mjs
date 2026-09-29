@@ -400,6 +400,25 @@ export function openEvidenceStore(file) {
         args: getPayload(row.arguments_sha), window_start: row.started_at_ms, window_end: row.window_end ?? null }));
     },
 
+    /** A session's sandbox processes that no call accounts for, first seen at
+     * or after `sinceMs`, oldest first, each with its first exec event, its
+     * parent process, and the call that parent is tied to (null when none). */
+    unattributedProcesses({ sessionId, sinceMs }) {
+      if (!sessionId) return [];
+      const accepted = (process) => `SELECT a.tool_call_id FROM runtime_attributions a JOIN runtime_events e ON e.id = a.event_id
+        WHERE e.process_id = ${process} AND a.status = 'accepted' LIMIT 1`;
+      return q(`SELECT p.id AS process_id, p.parent_process_id, p.first_seen_ms, ev.id AS event_id, ev.payload_json,
+          (${accepted('p.parent_process_id')}) AS parent_call_id
+        FROM runtime_processes p
+        JOIN runtime_sandboxes s ON s.id = p.sandbox_id
+        JOIN runtime_events ev ON ev.id = (SELECT e.id FROM runtime_events e
+          WHERE e.process_id = p.id AND e.event_kind = 'exec_succeeded' ORDER BY e.stream_sequence LIMIT 1)
+        WHERE s.project_id = ? AND p.first_seen_ms >= ? AND NOT EXISTS (${accepted('p.id')})
+        ORDER BY p.first_seen_ms, ev.stream_sequence`).all(sessionId, Math.round(sinceMs))
+        .map((row) => ({ process_id: row.process_id, parent_process_id: row.parent_process_id ?? null, event_id: row.event_id, first_seen_ms: row.first_seen_ms,
+          parent_call_id: row.parent_call_id ?? null, raw: fromJson(row.payload_json) ?? {} }));
+    },
+
     // ---- readers (the dashboard)
 
     /** Proposed vs observed for every call in these exchanges: the call, and

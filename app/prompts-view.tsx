@@ -42,7 +42,7 @@ export function PromptsView({ traces, selectedId, onSelect, onOpen }: {
           <button type="button" className="rt-prompt-row" aria-expanded={open} onClick={() => onSelect(open ? '' : trace.id)}>
             <time dateTime={trace.startedAt}>{new Date(trace.startedAt).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })}</time>
             <strong>{firstLine(trace.title)}</strong>
-            <small>{trace.model} · {calls} tool call{calls === 1 ? '' : 's'} · {money(cost)}</small>
+            <small>{trace.model} · {calls} tool call{calls === 1 ? '' : 's'} · {money(cost, trace.requests?.some((r) => r.costEstimated))}</small>
           </button>
           {open && <div className="rt-prompt-detail">
             <h3>Prompt</h3>

@@ -2,9 +2,12 @@
 import { requestMetrics } from './request-metrics.mjs';
 /** Local API recorder. Point a compatible client at http://127.0.0.1:8797. */
 import { createServer } from 'node:http';
-import { appendFile, mkdir } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, stat } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
+import { exchangesFromTranscript, parseTranscript } from './claude-code-adapter.mjs';
 import { evidenceFor, replayEligibility, createExperiment, runExperiment, outcome, proposedCommand } from './experiment-engine.mjs';
 import { loadEnvFile } from 'node:process';
 import { providerConfig, routeRequest, selectModel } from './providers.mjs';
@@ -15,7 +18,7 @@ import { explanationRequest, parseExplanations } from './explanations.mjs';
 import { summaryRequest, parseSummary } from './summaries.mjs';
 import { fold as foldEvents, describeAll, undescribed, describeRequest, parseDescriptions } from './exec-narrative.mjs';
 import { matchBatch, OPEN_WINDOW_CAP_MS } from './execution-correlation.mjs';
-import { startGvisorForwarder } from './gvisor-forwarder.mjs';
+import { startGvisorForwarder, commandMarker } from './gvisor-forwarder.mjs';
 import { omitToolChunkIds, toolResultStatus } from './tool-metadata.mjs';
 import { openEvidenceStore } from './evidence-store.mjs';
 import { typesafeConfig, systemOne } from './typesafe.mjs';
@@ -445,6 +448,108 @@ function ingestExecutions(events, { sessionId = null } = {}) {
   return matches;
 }
 
+// ---------------------------------------------------------------- Claude Code
+// Proxy-free capture: Claude Code's hooks ring, and its session transcript is
+// rebuilt into the same exchange rows the proxy records (claude-code-adapter).
+const claudeProjects = resolve(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'projects');
+const CLAUDE_CODE_FINAL_EVENTS = new Set(['Stop', 'SubagentStop', 'SessionEnd']);
+function claudeCodeTranscriptPath(value) {
+  if (typeof value !== 'string' || !value.endsWith('.jsonl')) return null;
+  try {
+    const real = realpathSync(value);
+    return real.startsWith(`${realpathSync(claudeProjects)}/`) ? real : null;
+  } catch { return null; }
+}
+// One job at a time per transcript (a write, then a read); later rings queue.
+const claudeCodeQueues = new Map();
+function serially(path, job) {
+  const next = (claudeCodeQueues.get(path) ?? Promise.resolve()).then(job);
+  const settled = next.catch(() => {}).finally(() => { if (claudeCodeQueues.get(path) === settled) claudeCodeQueues.delete(path); });
+  claudeCodeQueues.set(path, settled);
+  return next;
+}
+/** `session` files the rows under a sandbox's rtp- id instead of the
+ * transcript's own session, and ties its processes to them afterwards. */
+function ingestClaudeCode(path, { final, session = null }) {
+  serially(path, async () => {
+    const rows = exchangesFromTranscript(parseTranscript(await readFile(path, 'utf8')),
+      { final, sessionId: session?.id ?? null, sessionStartedAt: session?.startedAt ?? null });
+    for (const row of rows) {
+      await record({ ...row, request: { ...row.request, payload: redact(row.request.payload) }, response: { ...row.response, payload: redact(row.response.payload) } });
+    }
+    if (session) attributeLateProcesses(session.id);
+  }).catch((error) => console.error(`Claude Code transcript ${path} could not be read: ${error.message}`));
+}
+
+// A sandboxed Claude Code's transcript lives in the sandbox. Its hook sends
+// the new lines through the sandbox manager, which names the sandbox; they
+// are appended to a copy here and read like any local transcript. `offset`
+// must equal the copy's size, so a lost or repeated send is never spliced in
+// twice: a mismatch answers 409 with the size to resend from.
+const SANDBOX_ID = /^rtp-[a-f0-9]{32}$/;
+const CLAUDE_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const sandboxTranscripts = join(dirname(store), 'claude-code');
+async function appendSandboxTranscript(sandbox, note) {
+  if (!CLAUDE_SESSION_ID.test(note?.session_id ?? '') || !Number.isInteger(note.offset) || note.offset < 0
+    || typeof note.text !== 'string' || (note.text && !note.text.endsWith('\n'))) return { status: 400, body: { error: 'Expected session_id, offset and whole transcript lines.' } };
+  const directory = join(sandboxTranscripts, sandbox);
+  const path = join(directory, `${note.session_id}.jsonl`);
+  return serially(path, async () => {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const size = await stat(path).then((info) => info.size, () => 0);
+    if (note.offset !== size) return { status: 409, body: { size } };
+    if (note.text) await appendFile(path, note.text, { mode: 0o600 });
+    return { status: 200, body: { size: size + Buffer.byteLength(note.text) }, path };
+  });
+}
+
+/**
+ * Ties a sandbox's processes to the calls they ran for, after the fact.
+ * Claude Code starts a tool before its answer has finished streaming, and a
+ * call is only recorded once the answer is complete, so the gVisor forwarder
+ * has usually seen the process before the call it belongs to exists. Once
+ * the call is recorded, the same rules apply as at exec time: the call id the
+ * process carries (checked against this session's own calls), else a process
+ * started by one already tied to a call inherits it, else the text match.
+ */
+function attributeLateProcesses(sessionId) {
+  const now = Date.now();
+  const candidates = db.candidatesInWindow(now - 24 * 3_600_000, now + 60_000, { sessionId });
+  if (!candidates.length) return;
+  const margin = 2_000;
+  const processes = db.unattributedProcesses({ sessionId, sinceMs: Math.min(...candidates.map((c) => c.window_start)) - margin });
+  const byExternalId = new Map(candidates.map((c) => [c.external_call_id, c]));
+  const claimed = new Set();
+  const callOfProcess = new Map(); // process id -> call id, for children within this pass
+  const unmatched = [];
+  let tied = 0;
+  for (const proc of processes) {
+    const argv = Array.isArray(proc.raw.argv) ? proc.raw.argv.filter((part) => typeof part === 'string') : [];
+    const command = argv.join(' ').trim();
+    const marker = proc.raw.markers?.RAYTRACE_CALL_ID ?? commandMarker(command);
+    const marked = marker ? byExternalId.get(marker) : null;
+    const parentCall = proc.parent_call_id ?? callOfProcess.get(proc.parent_process_id);
+    let call = null; let method = null;
+    if (marked && !claimed.has(marked.call_id)) { call = marked.call_id; method = 'marker'; claimed.add(call); }
+    else if (parentCall) { call = parentCall; method = 'inherited'; }
+    else if (marked) { call = marked.call_id; method = 'inherited'; }
+    if (call) {
+      db.attribute({ toolCallId: call, eventId: proc.event_id, method, confidence: method === 'marker' ? 'exact' : 'corroborated', score: method === 'marker' ? 1 : null });
+      callOfProcess.set(proc.process_id, call);
+      tied += 1;
+    } else if (command && Number.isFinite(proc.first_seen_ms)) unmatched.push({ id: proc.event_id, command, timestamp: proc.first_seen_ms, margin, process_id: proc.process_id });
+  }
+  const found = matchBatch(unmatched, candidates.filter((c) => !claimed.has(c.call_id)));
+  for (const exec of unmatched) {
+    const match = found.get(exec.id);
+    if (!match) continue;
+    db.attribute({ toolCallId: match.call_id, eventId: exec.id, method: match.basis === 'id' ? 'marker' : match.basis, confidence: 'corroborated',
+      score: match.score, windowStartMs: match.window_start ?? null, windowEndMs: match.window_end ?? null });
+    tied += 1;
+  }
+  if (tied) console.log(`[raytace][claude-code] ${sessionId.slice(0, 12)}: tied ${tied} sandbox process(es) to calls recorded after they ran`);
+}
+
 const server = createServer(async (req, res) => {
   const localApi = req.url?.startsWith('/raytace/');
   // Paid replay endpoints require a preflighted custom header and trusted origin.
@@ -573,7 +678,33 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && jobRoute[2] && req.headers['x-raytace-experiment'] === '1') { jobControllers.get(job.id)?.abort(); return json(200, job); }
     return json(405, { error: 'Unsupported experiment operation.' });
   }
-  if (localApi && (req.method !== 'POST' || !['/raytace/experiments', '/raytace/step-runs', '/raytace/explanations', '/raytace/summaries', '/raytace/prompt-context/summary'].includes(req.url))) return json(404, { error: 'Unknown local endpoint.' });
+  // Claude Code hook doorbell (proxy/claude-code-hook.mjs): "this session's
+  // transcript has new lines". Answered at once; the transcript is read
+  // afterwards so the hook never holds Claude Code up. The custom header is
+  // not in the CORS allow-list, so a web page cannot ring it. From a sandbox
+  // (worker/gvisor/claude-hook.mjs, via the sandbox manager, which names the
+  // sandbox) the ring carries the new lines themselves.
+  if (req.method === 'POST' && req.url === '/raytace/ingest/claude-code') {
+    if (req.headers['x-raytace-hook'] !== '1' || !req.headers['content-type']?.includes('application/json')) return json(403, { error: 'Claude Code hook requests only.' });
+    const sandbox = SANDBOX_ID.test(req.headers['x-raytace-session-id'] ?? '') ? req.headers['x-raytace-session-id'] : null;
+    const chunks = []; let size = 0;
+    for await (const part of req) { size += part.length; if (size > (sandbox ? 4_500_000 : 64_000)) return json(413, { error: 'Request too large.' }); chunks.push(part); }
+    let note;
+    try { note = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return json(400, { error: 'Invalid JSON.' }); }
+    if (sandbox) {
+      const written = await appendSandboxTranscript(sandbox, note).catch(() => ({ status: 500, body: { error: 'Transcript copy could not be written.' } }));
+      json(written.status, written.body);
+      if (written.path) ingestClaudeCode(written.path, { final: CLAUDE_CODE_FINAL_EVENTS.has(note.hook_event_name),
+        session: { id: sandbox, startedAt: req.headers['x-raytace-session-started-at'] ?? null } });
+      return;
+    }
+    const path = claudeCodeTranscriptPath(note?.transcript_path);
+    if (!path) return json(400, { error: 'transcript_path must be a Claude Code transcript under ~/.claude/projects.' });
+    json(202, { accepted: true });
+    ingestClaudeCode(path, { final: CLAUDE_CODE_FINAL_EVENTS.has(note.hook_event_name) });
+    return;
+  }
+  if (localApi && (req.method !== 'POST' || !['/raytace/experiments', '/raytace/step-runs','/raytace/explanations', '/raytace/summaries', '/raytace/prompt-context/summary'].includes(req.url))) return json(404, { error: 'Unknown local endpoint.' });
   if (localApi && (req.headers['x-raytace-experiment'] !== '1' || !req.headers['content-type']?.includes('application/json'))) return json(403, { error: 'Use the experiment control in the dashboard.' });
   const parts = []; let bytes = 0;
   for await (const part of req) { bytes += part.length; if (bytes > (localApi ? 600_000 : 20_000_000)) return json(413, { error: 'Request too large.' }); parts.push(part); }

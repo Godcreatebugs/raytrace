@@ -108,6 +108,7 @@ service's own log rather than leaving the dashboard silently empty.
 npm run dev:all -- --status     # what is alive
 npm run dev:all -- --stop       # stop the services and the watcher
 npm run dev:all -- --no-codex   # services only
+npm run dev:all -- --claude     # Claude Code instead of Codex
 npm run dev:all -- rtp-<id>     # a specific sandbox
 ```
 

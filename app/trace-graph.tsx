@@ -30,6 +30,7 @@ type NodeData = {
   summaryLoading: boolean;
   failed: boolean | null;
   cost: number | null;
+  costEstimated: boolean;
   durationMs: number | null;
   verifiedCount: number;
   totalCalls: number;
@@ -48,7 +49,7 @@ function RequestNode({ data }: NodeProps<Node<NodeData>>) {
       </div>
       <p className="graph-node-summary">{data.summaryLoading ? 'Summarizing…' : data.summaryText || 'No summary yet.'}</p>
       <div className="graph-node-meta">
-        <span>{money(data.cost)}</span>
+        <span>{money(data.cost, data.costEstimated)}</span>
         <span>{duration(data.durationMs)}</span>
         {data.totalCalls > 0 && <span className={data.verifiedCount === data.totalCalls ? 'graph-node-verified-all' : 'graph-node-verified-partial'}>{data.verifiedCount}/{data.totalCalls} verified</span>}
       </div>
@@ -83,6 +84,7 @@ export function TraceGraph({ trace, blocks, summaries, onSelectStep }: { trace: 
           summaryLoading: summary?.status === 'loading',
           failed,
           cost: metric?.cost ?? null,
+          costEstimated: metric?.costEstimated ?? false,
           durationMs: metric?.durationMs ?? null,
           verifiedCount: calls.filter((call) => call.verified).length,
           totalCalls: calls.length,

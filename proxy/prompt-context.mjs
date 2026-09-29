@@ -30,10 +30,17 @@ const itemText = (item) => {
   return textOf(item) || '';
 };
 
+// Claude Code attachments, as claude-code-adapter.mjs tags them.
+const CLAUDE_CODE_KINDS = { file: 'File', compact_file_reference: 'File read before compaction', skill_listing: 'Skills',
+  mcp_instructions_delta: 'MCP instructions', agent_listing_delta: 'Subagents', deferred_tools_delta: 'Tools',
+  environment: 'Environment', model: 'Model', date: 'Date' };
+
 /** Which harness injection a message is, or null for a real message. */
 function internalKind(item) {
   if (item?.role === 'developer' || item?.role === 'system') {
     const text = textOf(item) || '';
+    const claudeCode = text.match(/^<claude-code:([\w-]+)>/)?.[1];
+    if (claudeCode) return CLAUDE_CODE_KINDS[claudeCode] ?? 'Claude Code reminder';
     if (text.includes('<skills_instructions>')) return 'Skills';
     if (text.includes('<permissions')) return 'Permissions';
     return 'Developer instructions';

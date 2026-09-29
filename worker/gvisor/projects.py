@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import time
 
 LABEL = 'io.raytace.project'
 
@@ -40,7 +41,7 @@ def validate_archive(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['create', 'list', 'start', 'shell', 'stop', 'delete', 'approve-proxy'])
+    parser.add_argument('action', choices=['create', 'list', 'start', 'shell', 'stop', 'delete', 'approve-proxy', 'enable-claude'])
     parser.add_argument('id', nargs='?')
     parser.add_argument('--archive')
     parser.add_argument('--confirm')
@@ -116,6 +117,32 @@ def main():
                 archive.addfile(entry, io.BytesIO(config.encode()))
             run('docker', 'cp', '-a', '-', opts.id+':/home/node', input=buffer.getvalue())
         print('Proxy configured; reopen shell to use it')
+    elif opts.action == 'enable-claude':
+        # The hook script arrives on stdin from the Mac (worker/gvisor/claude-hook.mjs).
+        # Installed root-owned, with Claude Code's managed settings, which user
+        # and project settings cannot override: the agent can read both, not
+        # change them. Re-running replaces them with the current version.
+        hook = sys.stdin.buffer.read(262145)
+        if not 0 < len(hook) <= 262144:
+            raise ValueError('Expected the hook script on stdin')
+        command = 'node /opt/raytace-claude/hook.mjs'
+        settings = json.dumps({'hooks': {
+            'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': command, 'timeout': 5}]}],
+            **{event: [{**({'matcher': '*'} if event == 'PostToolUse' else {}),
+                        'hooks': [{'type': 'command', 'command': command, 'timeout': 15}]}]
+               for event in ('PostToolUse', 'Stop', 'SubagentStop', 'SessionEnd')}}}, indent=2).encode()
+        # Written by root from inside the container: docker cp does not keep
+        # owners under gVisor, and a node-owned hook is one the agent can edit.
+        # Needs the container running. Files an older install left node-owned
+        # are emptied by node, then their directories removed by root.
+        subprocess.run(['docker', 'exec', '-u', '1000', opts.id, 'sh', '-c',
+            'rm -rf /opt/raytace-claude/* /etc/claude-code/*'], stderr=subprocess.DEVNULL)
+        for path, content in (('/opt/raytace-claude/hook.mjs', hook), ('/etc/claude-code/managed-settings.json', settings)):
+            directory = path.rsplit('/', 1)[0]
+            run('docker', 'exec', '-i', '-u', '0', opts.id, 'sh', '-c',
+                f'if [ -O {directory} ]; then :; else rm -rf {directory}; fi; mkdir -p -m 755 {directory} && '
+                f'cat > {path}.new && chmod 644 {path}.new && mv {path}.new {path}', input=content)
+        print('Claude Code hooks installed')
     elif opts.action in ('shell', 'start'):
         preflight()
         if not state['State']['Running']:

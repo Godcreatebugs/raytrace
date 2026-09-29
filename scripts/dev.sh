@@ -5,14 +5,16 @@
 #   npm run dev:all -- --status     what is alive
 #   npm run dev:all -- --stop       stop the services and the watcher
 #   npm run dev:all -- --no-codex   services only; print the sandbox:open line
+#   npm run dev:all -- --claude     open Claude Code instead of Codex
 #   npm run dev:all -- rtp-<id>     open a specific sandbox
 #
 # Services run detached and write to .raytace/logs/<name>.log. The terminal you
-# run this from becomes your Codex session.
+# run this from becomes your agent session.
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 OPEN_CODEX=1
+AGENT=codex
 WANT_SANDBOX=""
 ACTION=start
 for arg in "$@"; do
@@ -20,8 +22,9 @@ for arg in "$@"; do
     --status)    ACTION=status ;;
     --stop)      ACTION=stop ;;
     --no-codex)  OPEN_CODEX=0 ;;
+    --claude)    AGENT=claude ;;
     rtp-*)       WANT_SANDBOX="$arg" ;;
-    -h|--help)   sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)   sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)           echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -253,6 +256,28 @@ say "[ready ] logs       .raytace/logs/{proxy,sandbox,dev,watch}.log"
 if [ "$OPEN_CODEX" -eq 0 ]; then
   say "[ready ] open it with:  npm run sandbox:open -- $sandbox_id"
   exit 0
+fi
+
+if [ "$AGENT" = claude ]; then
+  # Claude Code signs in with your own account inside the sandbox and talks to
+  # Anthropic directly; RayTrace reads its transcript (claude-hook.mjs, sent
+  # through the sandbox manager) instead of its traffic. Hooks are reinstalled
+  # every time so the sandbox always runs the repo's current version.
+  if ! limactl shell "$VM" -- sudo python3 /opt/raytace/projects.py enable-claude "$sandbox_id" \
+      < "$ROOT/worker/gvisor/claude-hook.mjs" >> "$(log_file doctor)" 2>&1; then
+    say "[box   ] Claude Code hooks ......... FAILED -- the VM's projects.py may be older than the repo:"
+    say "[box   ]     limactl copy worker/gvisor/projects.py $VM:/tmp/projects.py"
+    say "[box   ]     limactl shell $VM sudo cp /tmp/projects.py /opt/raytace/projects.py"
+    exit 1
+  fi
+  say "[box   ] Claude Code hooks ......... installed"
+  say "[ready ] opening Claude Code in $sandbox_id ..."
+  say ""
+  # Installed once into the sandbox's persistent home, not the image, so an
+  # existing sandbox gets it too. --dangerously-skip-permissions for the same
+  # reason Codex skips its own sandbox: gVisor is the sandbox here.
+  exec limactl shell "$VM" -- sudo docker exec -it "$sandbox_id" /bin/bash -lc \
+    'export PATH=/home/node/.local/bin:/usr/local/bin:/usr/bin:/bin; if ! command -v claude >/dev/null; then echo "Installing Claude Code in this sandbox (first time only)..."; npm install -g --prefix /home/node/.local @anthropic-ai/claude-code || exit 1; fi; exec claude --dangerously-skip-permissions'
 fi
 
 say "[ready ] opening Codex in $sandbox_id ..."
