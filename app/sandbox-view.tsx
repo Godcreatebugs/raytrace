@@ -71,12 +71,14 @@ export function SandboxView({ trace, focusCall, onOpenCall }: {
     return <Fragment key={command.event_id}>
       <tr id={key ? `proc-${key.replace(':', '-')}` : undefined}
         className={`rt-row${depth ? ' rt-child' : ''}${outcome.tone === 'fail' ? ' failed' : ''}${focused(command) ? ' rt-focus' : ''}`}
-        onClick={kids.length ? () => toggle(command.event_id) : undefined}>
+        onClick={kids.length ? () => toggle(command.event_id) : undefined}
+        aria-expanded={kids.length ? expanded : undefined}>
         <td className="rt-time">{clockTime(started)}</td>
-        <td className="rt-cmd" style={{ paddingLeft: `${8 + depth * 18}px` }}>
-          {kids.length ? <ChevronRight size={12} className={`rt-caret${expanded ? ' down' : ''}`} /> : <span className="rt-caret-gap" />}
-          <span title={command.command}>{command.description ?? <CommandText text={command.command} />}</span>
-          {kids.length > 0 && <small className="rt-muted"> · {kids.length} child{kids.length === 1 ? '' : 'ren'}</small>}
+        <td className="rt-cmd">
+          <span className={`rt-cmd-line${kids.length ? ' rt-parent' : ''}`} style={{ paddingLeft: `${depth * 22}px` }}>
+            {kids.length ? <ChevronRight size={14} className={`rt-caret${expanded ? ' down' : ''}`} aria-hidden="true" /> : <span className="rt-caret-gap" />}
+            <span className="rt-cmd-text" title={command.command}>{command.description ?? <CommandText text={command.command} />}</span>
+          </span>
         </td>
         <td className="rt-pid">{command.pid}</td>
         <td className={`exec-${outcome.tone}`}><OutcomeText outcome={outcome} /></td>

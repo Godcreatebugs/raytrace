@@ -19,6 +19,7 @@ import { startGvisorForwarder } from './gvisor-forwarder.mjs';
 import { omitToolChunkIds, toolResultStatus } from './tool-metadata.mjs';
 import { openEvidenceStore } from './evidence-store.mjs';
 import { typesafeConfig, systemOne } from './typesafe.mjs';
+import { promptContext, contextItemText, contextSummaryRequest, parseContextSummary } from './prompt-context.mjs';
 import { groupByCall, assessmentRequests, combineGroup, rulesOnly, withProbabilities } from './call-assessment.mjs';
 
 try { loadEnvFile(); } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -372,6 +373,28 @@ async function readTraces(includeHistory = false) {
 }
 
 
+// Context window sizes, from OpenRouter's public model list (no key needed),
+// fetched once. Null when the model is not listed or the list is unreachable.
+let contextWindows = null;
+async function contextWindow(model) {
+  if (!model) return null;
+  if (!contextWindows) {
+    contextWindows = fetch('https://openrouter.ai/api/v1/models', { signal: AbortSignal.timeout(5000) })
+      .then((response) => (response.ok ? response.json() : { data: [] }))
+      .then((body) => new Map((body.data ?? []).map((item) => [item.id, item.context_length ?? null])))
+      .catch(() => { contextWindows = null; return new Map(); });
+  }
+  const windows = await contextWindows;
+  return windows.get(model) ?? windows.get(`openai/${model}`) ?? windows.get(`anthropic/${model}`) ?? null;
+}
+/** The context analysis for one prompt, from the last request of its turn. */
+async function promptContextFor(traceId) {
+  const trace = (await readTraces(true)).find((item) => item.id === traceId);
+  const last = trace?.requests?.at(-1);
+  const entry = last ? await savedOrLive(last.id) : null;
+  if (!entry) return null;
+  return { trace, context: promptContext(entry, trace.title, trace.answer ?? '') };
+}
 async function savedOrLive(exchangeId) {
   return liveExchanges.get(exchangeId) || db.findExchange(exchangeId);
 }
@@ -518,6 +541,28 @@ const server = createServer(async (req, res) => {
     }
     catch (error) { return json(400, { error: error.message }); }
   }
+  const contextRoute = req.url?.match(/^\/raytace\/prompt-context\/([A-Za-z0-9_-]{1,80})$/);
+  if (req.method === 'GET' && contextRoute) {
+    try {
+      const found = await promptContextFor(contextRoute[1]);
+      if (!found) return json(404, { error: 'Prompt not found in the captured history.' });
+      const request = contextSummaryRequest(found.context, summaryModel);
+      const model = found.trace.requests?.at(-1)?.model ?? found.trace.model;
+      return json(200, { ...found.context, model, context_window: await contextWindow(model),
+        summary: request ? db.getSummary(request.key) : null, summary_needed: !!request, summary_model: summaryModel });
+    } catch (error) { return json(400, { error: error.message }); }
+  }
+  // One context item's full text, as the model received it, for opening in
+  // its own tab: /raytace/prompt-context/<trace>/item/<input index | instructions | tools>
+  const itemRoute = req.url?.match(/^\/raytace\/prompt-context\/([A-Za-z0-9_-]{1,80})\/item\/(\d{1,6}|instructions|tools)$/);
+  if (req.method === 'GET' && itemRoute) {
+    const trace = (await readTraces(true)).find((item) => item.id === itemRoute[1]);
+    const last = trace?.requests?.at(-1);
+    const entry = last ? await savedOrLive(last.id) : null;
+    const text = entry ? contextItemText(entry, itemRoute[2]) : null;
+    res.writeHead(text == null ? 404 : 200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+    return res.end(text ?? 'Not found in the captured context.');
+  }
   const summaryRoute = req.url?.match(/^\/raytace\/summaries\/([a-f0-9-]+)$/);
   if (req.method === 'GET' && summaryRoute) return json(200, { summary: db.summaryForSpan(summaryRoute[1]), model: summaryModel });
   if (req.method === 'GET' && req.url === '/raytace/experiments') return json(200, { experiments: [...jobs.values()].slice(-30).reverse() });
@@ -528,7 +573,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && jobRoute[2] && req.headers['x-raytace-experiment'] === '1') { jobControllers.get(job.id)?.abort(); return json(200, job); }
     return json(405, { error: 'Unsupported experiment operation.' });
   }
-  if (localApi && (req.method !== 'POST' || !['/raytace/experiments', '/raytace/step-runs', '/raytace/explanations', '/raytace/summaries'].includes(req.url))) return json(404, { error: 'Unknown local endpoint.' });
+  if (localApi && (req.method !== 'POST' || !['/raytace/experiments', '/raytace/step-runs', '/raytace/explanations', '/raytace/summaries', '/raytace/prompt-context/summary'].includes(req.url))) return json(404, { error: 'Unknown local endpoint.' });
   if (localApi && (req.headers['x-raytace-experiment'] !== '1' || !req.headers['content-type']?.includes('application/json'))) return json(403, { error: 'Use the experiment control in the dashboard.' });
   const parts = []; let bytes = 0;
   for await (const part of req) { bytes += part.length; if (bytes > (localApi ? 600_000 : 20_000_000)) return json(413, { error: 'Request too large.' }); parts.push(part); }
@@ -555,6 +600,28 @@ const server = createServer(async (req, res) => {
         pendingExplanations.set(request.key, task);
       }
       try { return json(200, await pendingExplanations.get(request.key)); } finally { pendingExplanations.delete(request.key); }
+    } catch (error) { return json(400, { error: error.message }); }
+  }
+  if (req.method === 'POST' && req.url === '/raytace/prompt-context/summary') {
+    try {
+      if (routing.mode !== 'openrouter') return json(400, { error: 'Enable OpenRouter to generate summaries.' });
+      const found = await promptContextFor(String(JSON.parse(requestBody).trace_id ?? ''));
+      if (!found) return json(404, { error: 'Prompt not found in the captured history.' });
+      const request = contextSummaryRequest(found.context, summaryModel);
+      if (!request) return json(200, { prompts: [], answers: '' });
+      const cached = db.getSummary(request.key);
+      if (cached) return json(200, cached);
+      if (!pendingSummaries.has(request.key)) {
+        const task = (async () => {
+          const routed = routeRequest(routing, { method: 'POST', url: '/v1/responses', headers: {} }, Buffer.from(JSON.stringify(request.payload)));
+          const response = await invokeReplay({ headers: routed.headers, upstreamUrl: routed.url }, request.payload, new AbortController().signal);
+          const result = { ...parseContextSummary(response), model: summaryModel };
+          db.putSummary(request.key, null, result);
+          return result;
+        })();
+        pendingSummaries.set(request.key, task);
+      }
+      try { return json(200, await pendingSummaries.get(request.key)); } finally { pendingSummaries.delete(request.key); }
     } catch (error) { return json(400, { error: error.message }); }
   }
   if (req.method === 'POST' && req.url === '/raytace/summaries') {

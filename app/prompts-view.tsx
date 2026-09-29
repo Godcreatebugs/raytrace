@@ -15,7 +15,7 @@ export function PromptsView({ traces, selectedId, onSelect, onOpen }: {
   traces: Trace[];
   selectedId: string;
   onSelect: (traceId: string) => void;
-  onOpen: (view: 'calls' | 'sandbox', traceId: string) => void;
+  onOpen: (view: 'calls' | 'sandbox' | 'lab', traceId: string) => void;
 }) {
   const [day, setDay] = useState<string | null>(null);
   const shown = traces.filter((trace) => !day || dayKey(trace.startedAt) === day)
@@ -52,6 +52,7 @@ export function PromptsView({ traces, selectedId, onSelect, onOpen }: {
             <div className="rt-actions">
               <button type="button" className="rt-button" onClick={() => onOpen('calls', trace.id)}>Tool calls <ArrowRight size={14} /></button>
               {trace.sandboxId && <button type="button" className="rt-button" onClick={() => onOpen('sandbox', trace.id)}>Sandbox evidence <ArrowRight size={14} /></button>}
+              <button type="button" className="rt-button" onClick={() => onOpen('lab', trace.id)}>Lab <ArrowRight size={14} /></button>
             </div>
           </div>}
         </li>;

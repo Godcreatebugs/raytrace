@@ -23,7 +23,9 @@ function label(item: ContextItem) {
   if (item.preview.trim().startsWith('<environment_context>')) return 'Environment context';
   return item.action || `${item.kind} · ${item.preview.replace(/\s+/g, ' ').slice(0, 55)}`;
 }
-export function DecisionLab({ selected }: { selected?: SelectedStep }) {
+/** `focusCallId`: preselect that call's output as the context to change, for
+ * "Test impact" on a file the model read. */
+export function DecisionLab({ selected, focusCallId = null }: { selected?: SelectedStep; focusCallId?: string | null }) {
   const [step, setStep] = useState<Step | null>(null);
   const [models, setModels] = useState<{ alias: string; id: string }[]>([]);
   const [execution, setExecution] = useState(false);
@@ -49,11 +51,11 @@ export function DecisionLab({ selected }: { selected?: SelectedStep }) {
     if (!selected?.exchange_id || selected.output_index === undefined) return;
     api<Step>(`/steps/${selected.exchange_id}/${selected.output_index}`).then((data) => {
       if (closed) return; setStep(data); setModel(data.model);
-      const source = data.evidence.find((item) => item.id === data.hypotheses[0]?.evidence_id) || data.evidence[0];
+      const source = (focusCallId && data.evidence.find((item) => item.call_id === focusCallId)) || data.evidence.find((item) => item.id === data.hypotheses[0]?.evidence_id) || data.evidence[0];
       setEvidenceId(source?.id || ''); setContext(source?.content ?? source?.preview ?? '');
     }).catch((error) => { if (!closed) setError(error.message); }).finally(() => { if (!closed) setLoading(false); });
     return () => { closed = true; };
-  }, [selected?.exchange_id, selected?.output_index]);
+  }, [selected?.exchange_id, selected?.output_index, focusCallId]);
   useEffect(() => {
     let closed = false; let timer: ReturnType<typeof setTimeout>;
     const poll = async () => { try { const data = await api<{ experiments: Experiment[] }>('/experiments'); if (!closed) setExperiments(data.experiments); } catch { /* page shows connection status */ } if (!closed) timer = setTimeout(poll, 1500); };
