@@ -91,7 +91,7 @@ export function ToolCallsView({ trace, traces, focusCall, onOpenSandbox, onOpenL
   const stats: [string, string][] = [
     ['Round trips', String(requests.length)],
     ['Tool calls', String(calls.length)],
-    ['Cost', money(sumMetric(requests, 'cost'))],
+    ['Cost', money(sumMetric(requests, 'cost'), requests.some((r) => r.costEstimated))],
     ['Time', duration(turnSpan(requests))],
     ['Tokens in / out', `${tokenCount(sumMetric(requests, 'input'))} / ${tokenCount(sumMetric(requests, 'output'))}`],
     [models.length > 1 ? 'Models' : 'Model', models.join(', ') || trace.model],
@@ -128,7 +128,7 @@ export function ToolCallsView({ trace, traces, focusCall, onOpenSandbox, onOpenL
               <tr className="rt-trip"><td colSpan={6}>
                 <span>Round trip {block.number}</span>
                 {summary?.status === 'ready' && <em>{summary.text}</em>}
-                <small>{metric ? `${money(metric.cost)} · ${duration(metric.durationMs)}` : ''}{failed ? ' · failed' : ''}{answered && !own.length ? ' · answered' : ''}</small>
+                <small>{metric ? `${money(metric.cost, metric.costEstimated)} · ${duration(metric.durationMs)}` : ''}{failed ? ' · failed' : ''}{answered && !own.length ? ' · answered' : ''}</small>
               </td></tr>
               {own.map((call) => {
                 const reported = reportedResult(trace.events, call.call_id);

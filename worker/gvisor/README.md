@@ -23,7 +23,14 @@ codex
 
 Device login may require enabling device authentication in your account. See
 [official authentication documentation](https://developers.openai.com/codex/auth/).
-The image contains Codex CLI; Claude Code/Cursor adapters are not implemented.
+The image contains Codex CLI. For Claude Code, run `npm run dev:all -- --claude`:
+it installs Claude Code into the sandbox's home on first use (you sign in with
+your own account; its model traffic goes to Anthropic, not through RayTrace)
+and installs `claude-hook.mjs` as a root-owned managed hook. The hook tags each
+Bash command with its tool-call id (`RAYTRACE_CALL_ID`, an exact join for the
+evidence below) and sends the session transcript to RayTrace through the
+manager, which records it under the sandbox's `rtp-` id. A Cursor adapter is not
+implemented.
 The old `npm run codex` / `RAYTACE_CONTAINER` path is unchanged: use `sandbox:run`.
 Only commands launched through this sandbox are monitored, not arbitrary Mac apps.
 

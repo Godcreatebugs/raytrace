@@ -13,6 +13,8 @@
     "lint": "oxlint",
     "proxy": "node --disable-warning=ExperimentalWarning proxy/raytace-proxy.mjs",
     "codex": "node proxy/codex.mjs",
+    "claude-code:install": "node proxy/claude-code-install.mjs",
+    "claude-code:uninstall": "node proxy/claude-code-install.mjs uninstall",
     "sandbox:setup": "node proxy/gvisor-local.mjs setup",
     "sandbox:run": "node proxy/gvisor-local.mjs run",
     "sandbox:stop": "node proxy/gvisor-local.mjs stop",

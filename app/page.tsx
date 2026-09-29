@@ -4,14 +4,13 @@
 //   Prompts     what was asked and what came back (all prompts, by day)
 //   Tool calls  how the agent got there, for one prompt
 //   Sandbox     what actually ran, for one prompt
-//   Lab         what if one step had been different
+//   Lab         what the model had in context, and what if part of it changed
 // Which section and prompt are open lives in the URL, so every cross-link is a
 // real link and Back works.
 import { useCallback, useEffect, useState } from 'react';
 import { FlaskConical, MessagesSquare, ShieldCheck, Waypoints, Wrench } from 'lucide-react';
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select';
 import { type Trace } from './types';
-import { DecisionLab, type SelectedStep } from './decision-lab';
+import { LabView } from './lab-view';
 import { PromptsView } from './prompts-view';
 import { ToolCallsView } from './tool-calls-view';
 import { SandboxView } from './sandbox-view';
@@ -72,9 +71,6 @@ export default function Home() {
   }, []);
 
   const trace = traces.find((item) => item.id === place.trace);
-  const calls = trace?.callVerifications ?? [];
-  const steps: SelectedStep[] = calls.map((call, index) => ({ exchange_id: call.exchange_id, output_index: call.output_index, title: `#${index + 1} ${call.name}`, detail: call.proposed ?? call.name }));
-  const step = steps.find((item) => stepKey(item) === place.step) ?? steps[0];
 
   const nav: { view: View; label: string; icon: typeof Wrench }[] = [
     { view: 'prompts', label: 'Prompts', icon: MessagesSquare },
@@ -116,16 +112,7 @@ export default function Home() {
     {place.view === 'sandbox' && (trace ? <SandboxView key={trace.id} trace={trace} focusCall={place.call}
       onOpenCall={(callId) => go({ view: 'calls', trace: trace.id, call: callId ?? null })} /> : noPrompt())}
 
-    {place.view === 'lab' && (trace ? <section className="rt-view rt-lab">
-      <header className="rt-view-head"><div><span className="eyebrow">LAB</span><h1>What if this step were different?</h1></div></header>
-      {steps.length ? <>
-        <label htmlFor="lab-step" className="workspace-label">STEP</label>
-        <NativeSelect id="lab-step" className="trace-picker" value={step ? stepKey(step) : ''}
-          onChange={(event) => go({ view: 'lab', trace: trace.id, step: event.target.value })}>
-          {steps.map((item) => <NativeSelectOption key={stepKey(item)} value={stepKey(item)}>{item.title} · {item.detail.slice(0, 80)}</NativeSelectOption>)}
-        </NativeSelect>
-        <div className="rt-lab-body"><DecisionLab key={step ? stepKey(step) : 'none'} selected={step} /></div>
-      </> : <p className="rt-empty">This prompt proposed no tool calls, so there is no step to experiment on.</p>}
-    </section> : noPrompt())}
+    {place.view === 'lab' && (trace ? <LabView key={trace.id} trace={trace} stepKey={place.step}
+      onStep={(key) => go({ view: 'lab', trace: trace.id, step: key })} /> : noPrompt())}
   </main>;
 }

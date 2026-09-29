@@ -2,7 +2,10 @@
 
 // GitHub-style activity: one square per day for the last year, shaded by how
 // many prompts were asked that day. Days are local dates, so a prompt sent at
-// 23:30 lands on the day the person sent it.
+// 23:30 lands on the day the person sent it. "Today" is the browser's date, so
+// the grid is drawn only in the browser: the server's clock (UTC) is a day
+// ahead of the Americas every evening, and would not match on hydration.
+import { useSyncExternalStore } from 'react';
 
 const WEEKS = 53;
 const DAY_NAMES = ['', 'Mon', '', 'Wed', '', 'Fri', ''];
@@ -14,6 +17,9 @@ export function dayKey(value: string | number | Date): string {
   return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
 }
 
+const noSubscribe = () => () => {};
+const localToday = () => dayKey(Date.now());
+
 const shade = (count: number) => (count === 0 ? 0 : count === 1 ? 1 : count <= 3 ? 2 : count <= 6 ? 3 : 4);
 
 export function ActivityGraph({ dates, selected, onSelect }: {
@@ -22,11 +28,12 @@ export function ActivityGraph({ dates, selected, onSelect }: {
   selected: string | null;
   onSelect: (day: string | null) => void;
 }) {
+  const todayKey = useSyncExternalStore(noSubscribe, localToday, () => null);
   const counts = new Map<string, number>();
   for (const date of dates) counts.set(dayKey(date), (counts.get(dayKey(date)) ?? 0) + 1);
 
   // Start on the Sunday WEEKS-1 weeks before this week's Sunday.
-  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const today = new Date(`${todayKey ?? '1970-01-01'}T00:00`);
   const start = new Date(today); start.setDate(today.getDate() - today.getDay() - (WEEKS - 1) * 7);
   const weeks: Date[][] = [];
   for (let w = 0; w < WEEKS; w += 1) {
@@ -46,7 +53,7 @@ export function ActivityGraph({ dates, selected, onSelect }: {
       <strong>{total} prompt{total === 1 ? '' : 's'}</strong>
       <span>on {activeDays} day{activeDays === 1 ? '' : 's'} in the last year</span>
     </div>
-    <div className="rt-activity-scroll">
+    {todayKey && <div className="rt-activity-scroll">
       <div className="rt-activity-grid" style={{ gridTemplateColumns: `28px repeat(${WEEKS}, 12px)` }}>
         <span />
         {months.map((month, index) => <span key={index} className="rt-activity-month">{month}</span>)}
@@ -64,7 +71,7 @@ export function ActivityGraph({ dates, selected, onSelect }: {
           }),
         ])}
       </div>
-    </div>
+    </div>}
     <div className="rt-activity-legend">Less {[0, 1, 2, 3, 4].map((level) => <i key={level} className={`rt-cell rt-cell-${level}`} />)} More</div>
   </section>;
 }

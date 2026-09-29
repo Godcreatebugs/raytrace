@@ -83,3 +83,35 @@ def forward(handler, state):
         if not started:handler.respond(502,{'error':'Host proxy connection failed'})
     finally:
         upstream.close();handler.close_connection=True
+
+def forward_transcript(handler, state):
+    """A sandboxed Claude Code's new transcript lines (claude-hook.mjs), to the
+    host proxy, named with the sandbox the token belongs to. No model call, so
+    OpenRouter mode is not required and the model limit does not apply."""
+    record=authorize(state,handler.headers.get('x-raytace-sandbox-token'))
+    if not record:return handler.respond(401,{'error':'Sandbox proxy access not approved or revoked'})
+    try:
+        size=int(handler.headers.get('Content-Length',0))
+        if not 0<size<=4*1024*1024:raise ValueError('Request must be at most 4 MiB')
+        body=handler.rfile.read(size)
+        json.loads(body)
+        with LIMIT_LOCK:
+            now=time.monotonic()
+            key=record['id']+':transcript'
+            recent=[t for t in USAGE.get(key,[]) if now-t<60]
+            if len(recent)>=600:return handler.respond(429,{'error':'600 transcript sends/minute sandbox limit'})
+            USAGE[key]=recent+[now]
+    except Exception as error:
+        return handler.respond(400,{'error':str(error) if isinstance(error,ValueError) else 'Invalid transcript request'})
+    upstream=http.client.HTTPConnection('127.0.0.1',8797,timeout=30)
+    try:
+        upstream.request('POST','/raytace/ingest/claude-code',body,{
+            'content-type':'application/json','x-raytace-hook':'1','x-raytace-session-id':record['id'],
+            'x-raytace-session-started-at':datetime.fromtimestamp(record['proxy_approved_at'], timezone.utc).isoformat()})
+        response=upstream.getresponse()
+        data=json.loads(response.read(65536) or b'{}')
+        handler.respond(response.status,data)
+    except Exception:
+        handler.respond(502,{'error':'Host proxy connection failed; run npm run proxy'})
+    finally:
+        upstream.close();handler.close_connection=True

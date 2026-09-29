@@ -62,6 +62,11 @@ export function msFromNs(ns) {
   } catch { return null; }
 }
 
+/** The call id a command's own text exports, or null. */
+export function commandMarker(command) {
+  return /(?:^|[\s;])export RAYTRACE_CALL_ID=([A-Za-z0-9_-]{1,128})(?=[\s;]|$)/.exec(String(command ?? ''))?.[1] ?? null;
+}
+
 /** One collector `exec_succeeded` event -> the shape matchBatch() consumes,
  * or null if it isn't one (other kinds, empty argv, no usable timestamp).
  * The id is the collector's own autoincrement event id, prefixed so it can
@@ -82,7 +87,11 @@ export function toExecutionEvent(event, clock = UNMEASURED_CLOCK) {
   // it IS the answer -- the call id travelled with the process -- and the
   // text matcher is skipped entirely. Absent on every event until something
   // in the spawn path stamps it, which is why the matcher stays the default.
-  const marker = event.markers && typeof event.markers === 'object' ? event.markers.RAYTRACE_CALL_ID : null;
+  // A sandboxed Claude Code stamps it in the command itself (`export
+  // RAYTRACE_CALL_ID=...`, worker/gvisor/claude-hook.mjs): the shell that
+  // runs the command carries it in argv, the programs it starts in env.
+  const marker = (event.markers && typeof event.markers === 'object' ? event.markers.RAYTRACE_CALL_ID : null)
+    ?? commandMarker(command);
   return {
     id: `${rowPrefix(event.container_id)}${eventId}`,
     pid,
